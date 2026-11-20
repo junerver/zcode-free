@@ -864,7 +864,8 @@ main {
 .slot-head-row,
 .slot-row {
   display: grid;
-  grid-template-columns: 40px 100px minmax(240px, 1.3fr) 186px minmax(160px, 1fr) 48px;
+  /* 启用 / 时间 / 重复 / 目标 / 尝试·间隔 / 结果 / 删除 */
+  grid-template-columns: 40px 100px minmax(240px, 1.3fr) minmax(118px, .7fr) 186px minmax(160px, 1fr) 48px;
   gap: 14px;
   align-items: center;
 }
@@ -1045,7 +1046,7 @@ main {
 
 /* 窄屏:列模板放不下时整体横向滚动,不换行错位 */
 .slot-scroll { overflow-x: auto; }
-.slot-scroll .slot-list { min-width: 700px; }
+.slot-scroll .slot-list { min-width: 860px; }
 
 /* ---------- 场次日历:整月网格,过去标结果、未来标计划 ---------- */
 .cal-title { font-size: 12.5px; color: var(--t2); min-width: 96px; text-align: center; }
@@ -1480,12 +1481,242 @@ details[open] > summary::before { content: "▾ "; }
 .dialog-text { font-size: 12.5px; line-height: 1.75; color: var(--t1); white-space: pre-wrap; margin-bottom: 14px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
-/* ============================== 17. 无障碍与降级 ============================== */
+/* ============================== 17. 签到目标页 ============================== */
+/* 概览卡里的目标周期行:一行一个目标,名称左、结论右、备注下 */
+.tgt-rows { display: flex; flex-direction: column; gap: 6px; }
+.tgt-per {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--hair);
+}
+.tgt-per:last-child { border-bottom: 0; padding-bottom: 0; }
+.tgt-per.off { opacity: .45; }
+.tgt-per-name { font-size: 12.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tgt-per-state { font: 11px var(--mono); }
+.tgt-per-state.ok { color: var(--ok); }
+.tgt-per-state.wait { color: var(--amber); }
+.tgt-per-state.mute { color: var(--t3); }
+.tgt-per-sub { grid-column: 1 / -1; font-size: 11px; color: var(--t3); }
+.tgt-none { font-size: 12px; color: var(--t3); }
+
+/* 手动测试的目标下拉:贴在面板标题行右侧,和「试领一次」按钮同高 */
+.run-target-label { font-size: 11px; color: var(--t3); }
+.run-target {
+  height: 25px;
+  max-width: 210px;
+  padding: 0 7px;
+  background: var(--bg);
+  border: 1px solid var(--hair-2);
+  border-radius: var(--r-ctl);
+  font-size: 11.5px;
+  color: var(--t2);
+}
+.run-target:focus { border-color: var(--amber); outline: none; }
+
+/* 目标列表:与场次表同一套「表头 + 数据行共用列模板」的对齐方式 */
+.tgt-scroll { overflow-x: auto; }
+.tgt-list { min-width: 1020px; }
+.tgt-head-row,
+.tgt-row {
+  display: grid;
+  grid-template-columns: 22px minmax(150px, 1fr) minmax(130px, .9fr) 82px 82px 62px minmax(120px, .9fr) 34px 108px 40px;
+  gap: 12px;
+  align-items: center;
+}
+.tgt-head-row {
+  padding: 0 10px 8px 2px;
+  border-bottom: 1px solid var(--hair-2);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--t3);
+}
+.tgt-list.empty-list .tgt-head-row { display: none; }
+.tgt-row {
+  padding: 9px 10px 9px 2px;
+  border-bottom: 1px solid var(--hair);
+  transition: background .14s var(--ease);
+}
+.tgt-row:last-child { border-bottom: 0; }
+.tgt-row:hover { background: var(--s2); }
+.tgt-row.off .tgt-pick,
+.tgt-row.off .tgt-exe,
+.tgt-row.off .tgt-steps { opacity: .38; }
+.tgt-row.off .sw { opacity: .55; }
+/* 选中行是本页唯一的琥珀色焦点,底色抬一级 + 名称变色,不加边框免得挤动列宽 */
+.tgt-row.active { background: var(--s2); }
+.tgt-row.active .tgt-pick b { color: var(--amber); }
+.tgt-order { font-size: 11px; color: var(--t3); text-align: right; }
+.tgt-pick {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  align-items: flex-start;
+  min-width: 0;
+  padding: 0;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: var(--t1);
+}
+.tgt-pick b { font-size: 12.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.tgt-pick i { font-style: normal; font-size: 11px; color: var(--t3); }
+.tgt-exe { font-size: 11.5px; color: var(--t2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tgt-steps { font-size: 11.5px; color: var(--t2); }
+.tgt-status { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.tgt-move { display: flex; gap: 5px; }
+.tgt-move .btn { padding: 0 7px; }
+
+/* 徽标:流程与周期各一枚,靠底色区分,不引入第二种强调色 */
+.badge {
+  display: inline-block;
+  height: 19px;
+  line-height: 19px;
+  padding: 0 8px;
+  border-radius: var(--r-pill);
+  background: var(--s3);
+  color: var(--t2);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.badge.flow-steps { background: var(--amber-dim); color: #EFC177; }
+.badge.period-daily,
+.badge.period-weekly { background: var(--s3); color: var(--t2); }
+.badge.period-none { color: var(--t3); }
+.tgt-warn { font-size: 11px; color: var(--err); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.st-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--r-pill);
+  background: var(--hair-2);
+}
+.st-dot.on { background: var(--ok); }
+
+/* 录制台:底图 + 半透明标记层。标记是绝对定位的百分比,窗口大小变了也不会错位 */
+.rec-stage {
+  position: relative;
+  border: 1px solid var(--hair-2);
+  border-radius: var(--r-card);
+  background: var(--bg);
+  min-height: 128px;
+  overflow: hidden;
+}
+#recImage { display: block; width: 100%; height: auto; cursor: crosshair; }
+.rec-marks { position: absolute; inset: 0; pointer-events: none; }
+.rec-mark {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  transform: translate(-50%, -50%);
+  padding: 0 6px 0 0;
+  height: 19px;
+  border-radius: var(--r-pill);
+  background: var(--banner-bg);
+  border: 1px solid var(--amber-line);
+  color: var(--banner-fg);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.rec-mark i {
+  font-style: normal;
+  font: 11px var(--mono);
+  margin-right: 2px;
+  padding-left: 2px;
+}
+.rec-mark.bad { background: var(--banner-err-bg); border-color: rgba(224, 98, 92, .42); color: var(--banner-err-fg); }
+/* 补关点用绿色:和签到点击(琥珀)分开,一眼能看出图上哪个点是关浮窗的 */
+.rec-mark.post { background: var(--ok-dim); border-color: rgba(79, 180, 119, .42); color: var(--ok); }
+.rec-stage .empty { position: static; padding: 46px 18px; }
+.rec-mode { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.rec-mode .sec-note { font-size: 11.5px; color: var(--t3); }
+.rec-mode button[aria-pressed="true"] { border-color: var(--hair-2); background: var(--s3); color: var(--t1); }
+.post-head-row { margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--hair); }
+
+/* 步骤表:与上方列表同色系,但列窄,单独一套模板 */
+.step-head-row,
+.rec-step {
+  display: grid;
+  grid-template-columns: 26px minmax(140px, 1.4fr) 116px 96px 96px 96px 128px;
+  gap: 10px;
+  align-items: center;
+}
+.step-head-row {
+  margin-top: 12px;
+  padding: 0 4px 7px;
+  border-bottom: 1px solid var(--hair-2);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--t3);
+}
+.rec-step { padding: 7px 4px; border-bottom: 1px solid var(--hair); }
+.rec-step:last-child { border-bottom: 0; }
+.rec-step .mono { font-size: 11px; color: var(--t3); text-align: right; }
+.rec-step input,
+.rec-step select {
+  width: 100%;
+  min-width: 0;
+  height: 27px;
+  padding: 0 7px;
+  background: var(--bg);
+  border: 1px solid var(--hair-2);
+  border-radius: var(--r-ctl);
+  font-size: 11.5px;
+  color: var(--t1);
+}
+.rec-step input:focus,
+.rec-step select:focus { border-color: var(--amber); outline: none; }
+.rec-step .st-label { font-family: var(--ui); }
+.rec-step .st-dx,
+.rec-step .st-dy,
+.rec-step .st-wait { font-family: var(--mono); }
+.rec-step .tgt-move { gap: 4px; }
+.rec-step .tgt-move .btn { padding: 0 6px; }
+/* 校验出错的步骤:标红但不重画整行,保持可读 */
+.rec-step.bad .st-anchor,
+.rec-step.bad .st-dx,
+.rec-step.bad .st-dy { border-color: rgba(224, 98, 92, .42); }
+.rec-step.bad .rec-no { color: var(--err); }
+
+/* 场次表里新增的「目标」列 */
+.slot-target-wrap { min-width: 0; }
+.slot-target {
+  width: 100%;
+  min-width: 0;
+  height: 27px;
+  padding: 0 7px;
+  background: var(--bg);
+  border: 1px solid var(--hair-2);
+  border-radius: var(--r-ctl);
+  font-size: 11.5px;
+  color: var(--t2);
+}
+.slot-target:focus { border-color: var(--amber); outline: none; }
+.slot-row.off .slot-target { opacity: .38; }
+/* 日历胶囊后面的目标名:只在单独排了某个目标时出现,收进胶囊不撑宽格子 */
+.ws-tgt {
+  font-style: normal;
+  font-weight: 400;
+  margin-left: 4px;
+  padding-left: 4px;
+  border-left: 1px solid var(--amber-line);
+  font-size: 10.5px;
+}
+
+/* ============================== 18. 无障碍与降级 ============================== */
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: .001s !important; transition-duration: .001s !important; }
 }
 
-/* ============================== 18. 响应式 ============================== */
+/* ============================== 19. 响应式 ============================== */
 /* 满宽布局:先压列数,再拆成单列;任何档位都不产生横向滚动 */
 @media (max-width: 1560px) {
   .stages { grid-template-columns: repeat(2, minmax(0, 1fr)); }

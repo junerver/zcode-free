@@ -13,15 +13,17 @@ from pathlib import Path
 from loguru import logger
 
 import core.capture as capture
+import core.targets as tmod
 import core.zcode_ctrl as zcode
-from core.config import CONFIG_PATH, DATA_DIR, LOG_DIR, ConfigStore
+from core.config import CONFIG_PATH, DATA_DIR, DEFAULTS, LOG_DIR, ConfigStore
+from core.coords import ANCHORS, from_click, resolve
 from core.events import EventBus
 from core.logging_setup import get_logs
-from core.runner import Runner
+from core.runner import Runner, steps_for
 from core.scheduler import SlotScheduler, parse_days, parse_hhmm
 from core.storage import SessionStore
-from core.validate import normalize_box
-from core.vision import LOCATE_PROMPT, VERIFY_PROMPT, VisionClient
+from core.validate import judge_verify, normalize_box
+from core.vision import LOCATE_PROMPT, VERIFY_PROMPT, VisionClient, verify_prompt_for
 
 
 def _data_uri(data: bytes, mime: str) -> str:
@@ -52,6 +54,7 @@ class Api:
     def get_state(self, payload=None) -> dict:
         cfg = self.cfg.all()
         slots = cfg["schedule"].get("slots") or []
+        items = tmod.all_targets(cfg)
         return {
             "master": bool(cfg["schedule"].get("enabled", True)),
             "running": self.runner.is_running(),
@@ -63,12 +66,37 @@ class Api:
             "today": self.store.today_stats(),
             "recent": self.store.list_sessions(limit=12),   # 概览底部的记录表要铺满面板
             "has_key": bool((cfg["vision"].get("api_key") or "").strip()),
-            "zcode_path": cfg["app"].get("zcode_path") or "",
+            "targets": [self._target_view(t, cfg) for t in items],
             "dry_run": bool(cfg["app"].get("dry_run")),
             "config_path": str(CONFIG_PATH),
-            # 每周一次机会的窗口状态:面板据此显示"本周已领取,后续场次将跳过"
-            "weekly": dict(self.runner.weekly.state(),
-                           enabled=bool(cfg["app"].get("weekly_once", True))),
+        }
+
+    def _target_view(self, target: dict, cfg: dict) -> dict:
+        """给面板用的目标概览:配置 + 是否已在运行 + 本周期领取状态。"""
+        running = bool(zcode.pids_of_exe(target["exe"])) if target["exe"] else False
+        state = self.runner.claims.state(target["id"], target.get("once") or tmod.ONCE_NONE)
+        return {
+            "id": target["id"],
+            "name": target["name"],
+            "enabled": target["enabled"],
+            "exe": target["exe"],
+            "find_by": target["find_by"],
+            "window_title_match": target["window_title_match"],
+            "fullscreen": target["fullscreen"],
+            "startup_wait_s": target["startup_wait_s"],
+            "flow": target["flow"],
+            "verify": target["verify"],
+            "once": target["once"],
+            "steps": target["steps"],
+            "steps_count": len(target["steps"] or []),
+            "post_steps": target["post_steps"],
+            "post_steps_count": len(target["post_steps"] or []),
+            "running": running,
+            "executable_missing": bool(target["exe"]) and not Path(target["exe"]).is_file(),
+            "needs_setup": not target["exe"] or (
+                target["flow"] == tmod.FLOW_STEPS and not target["steps"]),
+            "phases": steps_for(target),
+            "period": state,
         }
 
     def set_master(self, payload=None) -> dict:
@@ -80,22 +108,259 @@ class Api:
         return {"ok": True, "master": enabled}
 
     def run_once(self, payload=None) -> dict:
-        """手动跑一次:<payload.dry=true> 为演练(只截图识别,不点击、不关客户端)。"""
+        """手动跑一次:<payload.dry> 为演练(只截图识别,不点击、不关客户端);
+        <payload.target> 指定只跑某个签到目标,留空则跑所有启用的目标。"""
         if self.runner.is_running():
             return {"ok": False, "message": "已有任务在执行,请稍候"}
         payload = payload or {}
         dry = bool(payload.get("dry"))
-        slot = {"dry": True} if dry else None
-        ok = self.runner.spawn("manual", slot)
+        slot: dict = {"dry": True} if dry else {}
+        if payload.get("target"):
+            slot["target"] = str(payload["target"])
+        items = self.runner.slot_targets(slot)
+        if not items:
+            return {"ok": False, "message": "没有可执行的签到目标,请先到「签到目标」页配置"}
+        ok = self.runner.spawn("manual", slot or None)
         if not ok:
             return {"ok": False, "message": "启动失败"}
-        return {"ok": True, "dry": dry,
-                "message": "演练已开始(不点击、不关客户端)" if dry else "已开始试领(完整流程)"}
+        names = "、".join(tmod.label(t) for t in items)
+        return {"ok": True, "dry": dry, "targets": [t["id"] for t in items],
+                "message": (f"演练已开始(不点击、不关客户端):{names}" if dry
+                            else f"已开始试领(完整流程):{names}")}
+
+    def run_target(self, payload=None) -> dict:
+        """面板「立即试跑这一项」:等价于 run_once + 指定 target。"""
+        payload = payload or {}
+        return self.run_once({**payload, "target": payload.get("target") or payload.get("id") or ""})
+
+    # ---------- 签到目标 ----------
+
+    def get_targets(self, payload=None) -> dict:
+        cfg = self.cfg.all()
+        items = tmod.all_targets(cfg)
+        return {
+            "targets": [self._target_view(t, cfg) for t in items],
+            "anchors": list(ANCHORS),
+            "flows": list(tmod.FLOWS),
+            "verifies": list(tmod.VERIFIES),
+            "once_modes": list(tmod.ONCE_MODES),
+            "next_step_id": f"step{len((items[0]['steps'] if items else [])) + 1}",
+        }
+
+    def save_targets(self, payload=None) -> dict:
+        """整表保存目标列表(面板一次提交全部,顺序即执行顺序)。"""
+        incoming = (payload or {}).get("targets")
+        if not isinstance(incoming, list):
+            return {"ok": False, "message": "缺少 targets 列表"}
+        cleaned = tmod.normalize_all(incoming)
+        if not cleaned:
+            return {"ok": False, "message": "至少需要一个签到目标"}
+        ids = {t["id"] for t in cleaned}
+        cfg = self.cfg.all()
+        slots = []
+        for slot in cfg["schedule"].get("slots") or []:
+            if isinstance(slot, dict) and str(slot.get("target") or "") not in ("", *ids):
+                # 场次指向已删除的目标:清掉引用,让它回落到"跑所有启用的目标"
+                slot = {**slot, "target": ""}
+            slots.append(slot)
+        self.cfg.patch({"targets": cleaned, "schedule": {"slots": slots}})
+        self.scheduler.reload()
+        self.bus.publish("state_change", {})
+        logger.info(f"签到目标已更新,共 {len(cleaned)} 个")
+        return {"ok": True, "targets": [self._target_view(t, self.cfg.all()) for t in cleaned]}
+
+    def delete_target(self, payload=None) -> dict:
+        tid = str((payload or {}).get("target") or (payload or {}).get("id") or "")
+        cfg = self.cfg.all()
+        items = [t for t in tmod.all_targets(cfg) if t["id"] != tid]
+        if len(items) == len(tmod.all_targets(cfg)):
+            return {"ok": False, "message": f"目标 {tid} 不存在"}
+        return self.save_targets({"targets": items})
+
+    def detect_target(self, payload=None) -> dict:
+        """探测/校验某个目标的 exe 路径。
+
+        只接受真实存在、且不是本程序自身的可执行文件 —— 打包后我们的进程名里
+        也含 "zcode",当年就是被自己的路径污染了配置才导致无限重开。
+        """
+        payload = payload or {}
+        cfg = self.cfg.all()
+        target = tmod.find(cfg, str(payload.get("target") or ""))
+        if not target:
+            return {"ok": False, "message": "未找到该签到目标"}
+        path = str(payload.get("path") or "").strip()
+        if not path:
+            path = zcode.autodetect_exe(
+                Path(target["exe"]).stem or target["window_title_match"] or "zcode") or ""
+        if not path:
+            return {"ok": False, "message": "未探测到该应用,请手动填写完整路径(含 .exe)"}
+        if not Path(path).is_file():
+            return {"ok": False, "message": f"路径不存在:{path}"}
+        if zcode.is_own_exe(path):
+            return {"ok": False, "message": "这个路径就是助手自己,不能作为签到目标"}
+        self._patch_target(target["id"], {"exe": path})
+        running = bool(zcode.pids_of_exe(path))
+        return {"ok": True, "path": path, "running": running,
+                "message": f"已设置:{path}" + ("" if running else "(当前未运行,到点会自动启动)")}
+
+    def probe_target(self, payload=None) -> dict:
+        """检查目标窗口能否被找到,并把每个录制点换算成屏幕坐标预览。"""
+        payload = payload or {}
+        cfg = self.cfg.all()
+        target = tmod.find(cfg, str(payload.get("target") or ""))
+        if not target:
+            return {"ok": False, "message": "未找到该签到目标"}
+        if isinstance(payload.get("steps"), list):
+            target = tmod.normalize({**target, "steps": payload["steps"]}, target["id"]) or target
+        if isinstance(payload.get("post_steps"), list):
+            target = (tmod.normalize({**target, "post_steps": payload["post_steps"]}, target["id"])
+                      or target)
+        if not target["exe"] or not Path(target["exe"]).is_file():
+            return {"ok": False, "message": "目标程序路径无效,请先在「签到目标」里设置 exe"}
+        win = zcode.find_target_window(target)
+        if win is None:
+            return {"ok": False, "running": False,
+                    "message": f"{tmod.label(target)} 没在运行(可点「启动并截图」先跑起来)"}
+        rect = zcode.effective_rect(win["hwnd"]) or win["rect"]
+        win["rect"] = list(rect)
+        def preview(steps, prefix: str = "") -> list[dict]:
+            out = []
+            for index, step in enumerate(steps or [], start=1):
+                point = resolve(rect, step)
+                out.append({
+                    "index": index, "label": step.get("label") or f"{prefix}第 {index} 步",
+                    "anchor": step.get("anchor"), "dx": step.get("dx"), "dy": step.get("dy"),
+                    "screen": list(point) if point else None,
+                    "ok": bool(point) and rect[0] <= point[0] <= rect[0] + rect[2]
+                    and rect[1] <= point[1] <= rect[1] + rect[3],
+                })
+            return out
+
+        points = preview(target.get("steps"))
+        # 补关点同样按窗口矩形换算:录制时量到的位置,过一天窗口挪了就可能点空
+        post_points = preview(target.get("post_steps"), "补关")
+        pid = zcode.window_pid(win["hwnd"])
+        # 提权的目标点不动:鼠标注入会被系统静默丢弃,提前说,别等试运行没反应再猜
+        elevated = zcode.runs_elevated(pid)
+        return {"ok": True, "running": True, "window": win["title"], "rect": rect,
+                "pid": pid, "points": points, "post_points": post_points, "elevated": elevated,
+                "message": (f"窗口:{win['title'] or win['hwnd']},{len(points)} 个点击点"
+                            + (f",{len(post_points)} 个补关点" if post_points else ""))
+                + (";它以管理员身份运行,助手权限不够点不进去——请用「以管理员身份运行」启动助手"
+                   if elevated else "")}
+
+    def _patch_target(self, target_id: str, changes: dict) -> dict:
+        """改动单个目标的其他字段(exe/步骤等),整表写回。"""
+        items = tmod.all_targets(self.cfg.all())
+        for item in items:
+            if item["id"] == target_id:
+                item.update({k: v for k, v in changes.items() if k != "id"})
+                break
+        cleaned = tmod.normalize_all(items)
+        self.cfg.patch({"targets": cleaned})
+        self.bus.publish("state_change", {})
+        return cleaned
+
+    # ---------- 位置录制 ----------
+
+    def _target_shot(self, target: dict, launch: bool = False):
+        """置顶(必要时启动)目标窗口并截一张图,返回 (截图, 窗口, 错误说明)。
+
+        必须用程序自己截的这张图来量坐标:窗口矩形含 -8,-8 这样的不可见边框偏移,
+        用户从外部截图软件量到的像素换算不过来,历史上因此点偏过。
+        """
+        if not target.get("exe") or not Path(target["exe"]).is_file():
+            return None, None, "目标程序路径无效,请先设置 exe 路径"
+        win = zcode.find_target_window(target)
+        if win is None and launch:
+            zcode.launch(target["exe"])
+            win = zcode.wait_target_window(
+                target, float(self.cfg.get("retry", "open_timeout_s", default=30)))
+            if win is not None:
+                wait = float(target.get("startup_wait_s") or 0)
+                if wait > 0:
+                    logger.info(f"{tmod.label(target)} 已启动,等待 {wait:.0f}s 界面加载…")
+                    time.sleep(wait)
+        if win is None:
+            return None, None, (f"{tmod.label(target)} 未运行:点「启动并截图」,"
+                                "或先手动打开它再截图")
+        stem = (Path(target["exe"]).stem or "zcode").lower()
+        ok, reason = zcode.verify_client_window(win, target["exe"], stem)
+        if not ok:
+            return None, win, f"窗口校验未通过:{reason}"
+
+        zcode.foreground(win["hwnd"])
+        if target.get("fullscreen", True):
+            zcode.maximize(win["hwnd"])
+            time.sleep(0.6)
+        deadline = time.time() + 12          # 界面还在加载时等它渲染出来
+        shot = None
+        while True:
+            fresh = zcode.effective_rect(win["hwnd"]) or win["rect"]
+            win["rect"] = list(fresh)
+            shot = capture.grab_region(tuple(fresh))
+            if shot.uniform_ratio <= 0.98 or time.time() >= deadline:
+                break
+            time.sleep(0.8)
+        return shot, win, ""
+
+    def capture_target(self, payload=None) -> dict:
+        """截一张目标窗口图给录制页当底图,并带回换算所需的窗口矩形。"""
+        payload = payload or {}
+        target = tmod.find(self.cfg.all(), str(payload.get("target") or ""))
+        if not target:
+            return {"ok": False, "message": "未找到该签到目标"}
+        if payload.get("launch") and self.runner.is_running():
+            return {"ok": False, "message": "有任务正在执行,先等它结束"}
+        shot, win, message = self._target_shot(target, launch=bool(payload.get("launch")))
+        if shot is None:
+            return {"ok": False, "message": message}
+        return {
+            "ok": True,
+            "target": target["id"],
+            "image": _data_uri(shot.png, "image/png"),
+            "rect": list(shot.rect),
+            "size": [shot.width, shot.height],
+            "window": win["title"],
+            "uniform_ratio": round(shot.uniform_ratio, 3),
+            "message": f"{win['title'] or win['hwnd']} · {shot.width}x{shot.height}",
+        }
+
+    def record_point(self, payload=None) -> dict:
+        """把录制页上的一次点击(图片像素)转成一步坐标。
+
+        前端只负责"在这张图上点了一下",锚点与偏移由后端按窗口矩形算,
+        这样换分辨率/换显示器时判定规则只有一处。
+        """
+        payload = payload or {}
+        rect = payload.get("rect")
+        try:
+            img_x = float(payload.get("x"))
+            img_y = float(payload.get("y"))
+        except (TypeError, ValueError):
+            return {"ok": False, "message": "缺少点击坐标"}
+        if not isinstance(rect, (list, tuple)) or len(rect) != 4:
+            return {"ok": False, "message": "缺少窗口矩形(请先截图)"}
+        x, y, w, h = (float(v) for v in rect)
+        if not (0 <= img_x <= w and 0 <= img_y <= h):
+            return {"ok": False, "message": f"点击落在窗口图之外({img_x:.0f},{img_y:.0f})"}
+        step = from_click(rect, img_x, img_y)
+        step["label"] = str(payload.get("label") or "").strip() or f"第 {int(payload.get('index') or 1)} 步"
+        step["wait_after_s"] = float(payload.get("wait_after_s") or 0.8)
+        step["screen"] = [int(round(x + img_x)), int(round(y + img_y))]
+        return {"ok": True, "step": step}
 
     # ---------- 场次 ----------
 
     def get_schedule(self, payload=None) -> dict:
-        return {"slots": self.cfg.get("schedule", "slots") or []}
+        cfg = self.cfg.all()
+        # 顺带把目标名单给出:场次表每行都有「跑哪个目标」的下拉,
+        # 少一次往返就少一次「下拉还没准备好」的空窗
+        return {
+            "slots": cfg["schedule"].get("slots") or [],
+            "targets": [{"id": t["id"], "name": t["name"], "enabled": t["enabled"]}
+                        for t in tmod.all_targets(cfg)],
+        }
 
     def save_schedule(self, payload=None) -> dict:
         slots = self._clean_slots((payload or {}).get("slots"))
@@ -105,26 +370,33 @@ class Api:
         logger.info(f"场次表已更新,共 {len(slots)} 个场次")
         return {"ok": True, "slots": slots}
 
-    @staticmethod
-    def _clean_slots(raw) -> list[dict]:
+    def _clean_slots(self, raw) -> list[dict]:
         out: list[dict] = []
         seen: set[tuple] = set()
+        ids = {t["id"] for t in tmod.all_targets(self.cfg.all())}
         for item in raw or []:
             if not isinstance(item, dict):
                 continue
             time_text = str(item.get("time") or "").strip()
             if parse_hhmm(time_text) is None:
                 continue
-            # days 为空表示每天;同一时间可以排在不同星期(如周五 19:00 与周六 19:00),
-            # 所以去重键是「时间 + 星期」而不是时间本身
+            # days 为空表示每天;同一时间可以排在不同星期/不同目标
+            # (例如周五 19:00 与周六 19:00,或 19:00 同时跑 ZCode 与 Trae),
+            # 所以去重键是「时间 + 星期 + 目标」
             days = parse_days(item.get("days"))
-            key = (time_text, tuple(days) if days else ())
+            target = str(item.get("target") or "").strip()
+            if target and target not in ids:
+                logger.warning(f"场次 {time_text} 引用了不存在的目标 {target},已改为跑全部目标")
+                target = ""
+            key = (time_text, tuple(days) if days else (), target)
             if key in seen:
                 continue
             seen.add(key)
             entry: dict = {"time": time_text, "enabled": bool(item.get("enabled", True))}
             if days:
                 entry["days"] = days
+            if target:
+                entry["target"] = target
             for key_name in ("attempts", "retry_gap_s"):
                 value = item.get(key_name)
                 if value in (None, "", "null"):
@@ -193,6 +465,12 @@ class Api:
         saved = (vision.get("api_key") or "").strip()
         vision["api_key"] = ""
         vision["api_key_hint"] = saved[-4:] if saved else ""
+        # 出厂默认(地址/模型)回填给面板:配置里留空只是"用默认"的写法,
+        # 直接下发空白会让用户以为自己的模型 id 没保存住。
+        defaults = DEFAULTS.get("vision") or {}
+        for key in ("base_url", "model"):
+            if not str(vision.get(key) or "").strip():
+                vision[key] = defaults.get(key, "")
         return vision
 
     def save_vision_config(self, payload=None) -> dict:
@@ -209,6 +487,12 @@ class Api:
                 incoming.pop("api_key", None)      # 留空 = 不修改,保留已存 Key
             else:
                 incoming["api_key"] = str(key).strip()
+            # 地址/模型留空 = 不修改,和 api_key 同一套约定(面板没有"清空模型"的入口,
+            # 空白只会是"这一格我没动")。配合 _masked_vision 的默认值回填,前端永远
+            # 收到的是真正在用的 id 并原样提交回来,所以用户填过的模型不会被悄悄抹掉。
+            for name in ("base_url", "model"):
+                if name in incoming and not str(incoming[name] or "").strip():
+                    incoming.pop(name, None)
             patch["vision"] = incoming
         if "verify_wait_s" in payload:
             patch.setdefault("retry", {})["verify_wait_s"] = payload["verify_wait_s"]
@@ -223,17 +507,11 @@ class Api:
         return {"ok": True, "vision": self._masked_vision()}
 
     def get_prompts(self, payload=None) -> dict:
-        return {"locate": LOCATE_PROMPT, "verify": VERIFY_PROMPT}
+        target = tmod.find(self.cfg.all(), str((payload or {}).get("target") or ""))
+        return {"locate": LOCATE_PROMPT, "verify": VERIFY_PROMPT,
+                "verify_active": verify_prompt_for(target), "target": (target or {}).get("id") or ""}
 
     # ---------- 探测与测试 ----------
-
-    def detect_zcode(self, payload=None) -> dict:
-        path = zcode.autodetect_exe() or ""
-        if path:
-            self.cfg.patch({"app": {"zcode_path": path}})
-            logger.info(f"已探测到 ZCode:{path}")
-        return {"ok": bool(path), "path": path,
-                "message": f"已找到:{path}" if path else "未找到 ZCode.exe,请手动填写完整路径"}
 
     def diagnose_shortcut(self, payload=None) -> dict:
         """诊断开始菜单快捷方式的解析链路(打包后验证 win32com 是否可用)。
@@ -305,33 +583,23 @@ class Api:
         return {"ok": True, "results": results}
 
     def test_locate(self, payload=None) -> dict:
-        cfg = self.cfg.all()
-        source = (payload or {}).get("source") or "window"
-        if source == "window":
-            match = cfg["app"].get("window_title_match") or "ZCode"
-            exe = (cfg["app"].get("zcode_path") or "").strip()
-            win = zcode.find_client_window(match, exe)   # 带进程校验,避免截到同名无关窗口
-            if win:
-                zcode.foreground(win["hwnd"])   # 先置顶,避免截到被遮挡或已最小化的画面
-                if cfg["app"].get("fullscreen", True):
-                    zcode.maximize(win["hwnd"])  # 与自动执行保持一致:全屏后再截图
-                    time.sleep(0.6)
-                shot = None
-                deadline = time.time() + 12          # 界面还在加载时等它渲染出来
-                while True:
-                    fresh = zcode.window_rect(win["hwnd"]) or win["rect"]
-                    shot = capture.grab_region(tuple(fresh))
-                    if shot.uniform_ratio <= 0.98 or time.time() >= deadline:
-                        break
-                    time.sleep(0.8)
-                pid = zcode.window_pid(win["hwnd"])
-                source_label = f"窗口:{win['title']}(PID {pid})"
+        """视觉定位自检:截目标窗口图 → 跑一次定位提示词 → 回传结果与框。"""
+        payload = payload or {}
+        target = tmod.find(self.cfg.all(), str(payload.get("target") or ""))
+        if not target:
+            return {"ok": False, "error": "没有配置任何签到目标"}
+        label = tmod.label(target)
+        shot = None
+        if (payload.get("source") or "window") == "window":
+            shot, win, message = self._target_shot(target, launch=bool(payload.get("launch")))
+            if shot is not None:
+                source_label = f"窗口:{win['title'] or win['hwnd']}"
             else:
-                shot = capture.grab_fullscreen()
-                source_label = "整屏(ZCode 窗口未找到或未通过进程校验)"
+                source_label = f"整屏({label}:{message})"
         else:
-            shot = capture.grab_fullscreen()
             source_label = "整屏"
+        if shot is None:
+            shot = capture.grab_fullscreen()
 
         result = self.vision.locate(shot.png)
         box = None
@@ -341,12 +609,32 @@ class Api:
         return {
             "ok": not result.get("error"),
             "result": result,
+            "target": target["id"],
             "source": source_label,
             "image": _data_uri(shot.png, "image/png"),
             "box": box,
             "size": [shot.width, shot.height],
             "error": result.get("error"),
         }
+
+    def test_verify(self, payload=None) -> dict:
+        """结果校验自检:按当前目标的提示词判一次画面,用于校准词表。"""
+        payload = payload or {}
+        target = tmod.find(self.cfg.all(), str(payload.get("target") or ""))
+        if not target:
+            return {"ok": False, "error": "没有配置任何签到目标"}
+        if payload.get("source") == "screen":
+            shot = capture.grab_fullscreen()
+        else:
+            shot, _win, message = self._target_shot(target, launch=bool(payload.get("launch")))
+            if shot is None:
+                return {"ok": False, "error": message}
+        result = self.vision.verify(shot.png, target)
+        verdict = judge_verify(
+            result, self.runner.validate_cfg_for(target), clicked=bool(payload.get("clicked", True)))
+        return {"ok": not result.get("error"), "verdict": verdict, "result": result,
+                "target": target["id"], "image": _data_uri(shot.png, "image/png"),
+                "size": [shot.width, shot.height], "error": result.get("error")}
 
     # ---------- 日志与记录 ----------
 
@@ -392,10 +680,11 @@ class Api:
         if action == "shots":
             count = self.store.clear_all()
             return {"ok": True, "message": f"已清除 {count} 个场次的截图"}
-        if action == "weekly":
-            self.runner.weekly.clear()
+        if action == "claims":
+            target = (payload or {}).get("target")
+            count = self.runner.claims.clear(str(target) if target else None)
             self.bus.publish("state_change", {})
-            return {"ok": True, "message": "已清除本周领取状态,后续场次将正常执行"}
+            return {"ok": True, "message": f"已清除 {count} 条领取记账,后续场次将正常执行"}
         if action == "logs":
             count = 0
             for log_file in LOG_DIR.glob("*.log"):

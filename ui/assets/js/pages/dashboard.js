@@ -3,17 +3,92 @@
   const $ = (id) => document.getElementById(id);
   window.PAGES = window.PAGES || {};
 
+  /* 每个签到目标一行:周期标签 + 本周期是否已领 + 需要留意的状态 */
+  function renderTargets(items) {
+    const box = $('targetPeriods');
+    if (!box) return;
+    box.innerHTML = '';
+    const list = items || [];
+    if (!list.length) {
+      const empty = document.createElement('span');
+      empty.className = 'tgt-none';
+      empty.textContent = '未配置签到目标';
+      box.appendChild(empty);
+      return;
+    }
+    list.forEach((t) => {
+      const p = t.period || {};
+      const row = document.createElement('div');
+      row.className = 'tgt-per' + (t.enabled === false ? ' off' : '');
+      const name = document.createElement('b');
+      name.className = 'tgt-per-name';
+      name.textContent = t.name || t.id;
+      const state = document.createElement('span');
+      const notes = [];
+      if (t.needs_setup) notes.push('未配置');
+      if (t.executable_missing) notes.push('路径不存在');
+      if (t.running) notes.push('运行中');
+      if (t.enabled === false) notes.push('已停用');
+      if (p.mode === 'none' && !notes.length) notes.push('不限周期');
+      row.title = notes.length ? notes.join(' · ') : '';
+      if (p.mode !== 'none') {
+        state.className = 'tgt-per-state ' + (p.claimed ? 'ok' : 'wait');
+        state.textContent = p.claimed ? '已领取' : '未领取';
+      } else {
+        state.className = 'tgt-per-state mute';
+        state.textContent = '每场都跑';
+      }
+      const sub = document.createElement('i');
+      sub.className = 'tgt-per-sub';
+      sub.textContent = notes.length ? notes.join(' · ') : (p.label || '');
+      row.appendChild(name);
+      row.appendChild(state);
+      row.appendChild(sub);
+      box.appendChild(row);
+    });
+  }
+
+  /* 手动测试的目标下拉:state 每次变化都会 refresh,所以只在目标名单真的变了
+     时才重建选项 —— 否则用户刚选的「只跑 Trae」会被一次状态推送冲掉。 */
+  let runTargetSig = null;
+  function renderRunTargets(items) {
+    const sel = $('runTarget');
+    if (!sel) return;
+    const list = items || [];
+    const sig = list.map((t) => t.id).join(',');
+    if (sig === runTargetSig) return;
+    runTargetSig = sig;
+    const keep = sel.value;
+    sel.innerHTML = '';
+    const all = document.createElement('option');
+    all.value = '';
+    all.textContent = '全部目标(按顺序挨个跑)';
+    sel.appendChild(all);
+    list.forEach((t) => {
+      const opt = document.createElement('option');
+      opt.value = t.id;
+      opt.textContent = (t.name || t.id) + (t.enabled === false ? '(已停用)' : '');
+      sel.appendChild(opt);
+    });
+    sel.value = keep && list.some((t) => t.id === keep) ? keep : '';
+  }
+
   window.PAGES.dashboard = {
     init() {
       $('gotoLogs').addEventListener('click', () => window.APP.switchTab('logs'));
 
-      // 手动测试区:完整流程 / 演练(不点击)
+      // 手动测试区:完整流程 / 演练(不点击),可只跑下拉里选中的那一个目标
       const bindRun = (id, dry) => {
         const button = $(id);
         if (!button) return;
         button.addEventListener('click', async () => {
+          const sel = $('runTarget');
+          const target = sel ? sel.value : '';
+          const payload = {};
+          if (dry) payload.dry = true;
+          if (target) payload.target = target;
           try {
-            const res = await window.API.call('run_once', dry ? { dry: true } : null);
+            const res = await window.API.call('run_once', Object.keys(payload).length ? payload : null);
             window.APP.toast((res && res.message) || '已开始', res && res.ok ? 'ok' : 'err');
             if (res && res.ok) window.APP.refreshState();
           } catch (err) {
@@ -58,24 +133,10 @@
       }
 
       // 数字卡片走显式滚动动画(只对纯数字生效),不再靠观察自身文字变化
-      // 本周福利:一周只有一次机会,这里显示窗口状态与是否已领取。
-      // 副标题是单行省略的,文案要短;完整原因在运行日志里。
-      const weekly = state.weekly || {};
-      const claimed = !!weekly.claimed;
-      $('cardWeekly').textContent = claimed ? '已领取' : '待领取';
-      $('cardWeekly').className = 'value ' + (claimed ? 'ok' : '');
-      if (!weekly.enabled) {
-        $('cardWeeklySub').textContent = '每周限制已关闭';
-        $('cardWeekly').removeAttribute('title');
-      } else if (claimed) {
-        const src = weekly.claimed_source === 'manual' ? '手动'
-          : (weekly.claimed_slot || '定时');
-        $('cardWeeklySub').textContent = `${src}已领 · 剩余场次跳过`;
-        $('cardWeekly').title = `${weekly.label || ''} 已于 ${weekly.claimed_at || ''} 领取成功;一周只有一次机会,剩余场次将跳过`;
-      } else {
-        $('cardWeeklySub').textContent = `${weekly.label || ''}`;
-        $('cardWeekly').title = `${weekly.label || ''} 尚未领取,${state.slots_enabled || 0} 个场次待执行`;
-      }
+      // 每个签到目标一行周期状态:周期是「每天 / 每周 / 不限」按目标配置,
+      // 全局的「每周一次」已经不存在了。
+      renderTargets(state.targets);
+      renderRunTargets(state.targets);
 
       // 「今日场次」只数今天真的会触发的启用场次:场次可只排在部分星期,
       // 未指定星期(每天)或 days 含今天才算
@@ -147,6 +208,7 @@
         tr.innerHTML = `
           <td class="mono">${window.UITL.esc(window.UITL.dt(item.started_at))}</td>
           <td>${window.UITL.esc(item.slot || '手动')}</td>
+          <td>${window.UITL.esc(item.target_name || '--')}</td>
           <td class="${info.cls}">${window.UITL.esc(info.text)}</td>
           <td>${window.UITL.esc(item.summary || '')}</td>
           <td>${item.attempts || 0}</td>

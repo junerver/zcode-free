@@ -16,6 +16,9 @@ import threading
 from pathlib import Path
 
 import yaml
+from loguru import logger
+
+from core.targets import DEFAULT_TARGETS
 
 FROZEN = getattr(sys, "frozen", False)
 
@@ -53,21 +56,15 @@ SHOTS_DIR = DATA_DIR / "shots"
 UI_DIR = RESOURCE_DIR / "ui"
 
 DEFAULTS: dict = {
+    # 全局运行时开关。每个签到目标的exe/窗口/流程/周期都在 targets 里,见 core/targets.py
     "app": {
-        "zcode_path": "",
-        "window_title_match": "ZCode",
-        "fullscreen": True,          # 操作前把客户端最大化(全屏),再截图
-        "startup_wait_s": 5.0,       # 启动客户端后等待界面加载的秒数(加载期画面可能是纯色)
-        "restore_window_rect": True,
-        "window_rect": [40, 40, 1240, 860],
         "dry_run": False,
-        # 福利一周只有一次机会(周期从周五算起)。本周期已领到后,后面的场次自动跳过,
-        # 配置保持不动,下周五自动恢复。关掉它则每个场次都照常执行。
-        "weekly_once": True,
     },
+    "targets": copy.deepcopy(DEFAULT_TARGETS),
     "schedule": {
         "enabled": True,
-        # 示例: {"time": "10:00", "enabled": True, "attempts": None, "retry_gap_s": None}
+        # 示例: {"time": "10:00", "enabled": True, "target": "zcode", "attempts": None, "retry_gap_s": None}
+        # target 留空 = 跑所有启用的目标;指定 id 则只跑那一个
         "slots": [],
         "keep_awake": True,
     },
@@ -125,14 +122,45 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
+def _with_migration(cfg: dict, path: Path, user_cfg: dict) -> dict:
+    """把 v1.x 的单目标 `app:` 配置翻译成 `targets` 列表,一次性落盘。
+
+    迁移只做保真(路径/标题/全屏/启动等待/每周一次),不改行为语义之外的东西;
+    每个已有场次补上 target,保证老配置迁移后跑的还是同一个应用。
+    """
+    from core.targets import migrate_from_legacy
+
+    # 判据必须是「用户文件里有没有自己的目标」:DEFAULTS 一直带一个出厂目标,
+    # 拿合并后的 cfg 判断会永远以为"已有 targets",v1.x 的配置就再也不会被迁移。
+    if not path.exists() or user_cfg.get("targets"):
+        return cfg
+    migrated = migrate_from_legacy({**cfg, "targets": user_cfg.get("targets")})
+    if not migrated:
+        return cfg
+    cfg["targets"] = migrated
+    # 旧键全部作废:留在文件里只会让人以为改它还有效
+    for legacy_key in ("zcode_path", "window_title_match", "fullscreen", "startup_wait_s",
+                       "restore_window_rect", "window_rect", "weekly_once"):
+        cfg.get("app", {}).pop(legacy_key, None)
+    slots = cfg.get("schedule", {}).get("slots") or []
+    for slot in slots:
+        if isinstance(slot, dict) and not slot.get("target"):
+            slot["target"] = migrated[0]["id"]
+    try:
+        save_config(cfg, path)
+    except OSError as exc:
+        logger.warning(f"配置迁移结果写入失败(本次仍按迁移后的配置运行):{exc}")
+    return cfg
+
+
 def load_config(path: Path = CONFIG_PATH) -> dict:
-    """读取配置并与默认值合并(缺项自动补全)。"""
+    """读取配置并与默认值合并(缺项自动补全),必要时执行一次旧配置迁移。"""
     user_cfg: dict = {}
     if path.exists():
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         if isinstance(raw, dict):
             user_cfg = raw
-    return _deep_merge(DEFAULTS, user_cfg)
+    return _with_migration(_deep_merge(DEFAULTS, user_cfg), path, user_cfg)
 
 
 def save_config(cfg: dict, path: Path = CONFIG_PATH) -> None:
@@ -176,10 +204,10 @@ class ConfigStore:
             return copy.deepcopy(self._cfg)
 
     def reset(self) -> dict:
-        """恢复默认配置(保留 zcode_path 与 api_key 之外全部重置)。"""
+        """恢复默认配置(保留签到目标与 API Key,其余全部重置)。"""
         with self._lock:
             keep = {
-                "app": {"zcode_path": self._cfg.get("app", {}).get("zcode_path", "")},
+                "targets": self._cfg.get("targets") or copy.deepcopy(DEFAULT_TARGETS),
                 "vision": {"api_key": self._cfg.get("vision", {}).get("api_key", "")},
             }
             self._cfg = _deep_merge(DEFAULTS, keep)

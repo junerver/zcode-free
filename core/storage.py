@@ -9,6 +9,7 @@ data/shots/<session_id>/
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import threading
 from datetime import date, datetime, timedelta
@@ -29,18 +30,29 @@ class SessionStore:
 
     # ---------- 写 ----------
 
-    def begin(self, trigger: str, slot: dict | None) -> dict:
-        """开启一次会话,返回会话 dict(由 runner 持有并持续更新)。"""
+    def begin(self, trigger: str, slot: dict | None, target: dict | None = None) -> dict:
+        """开启一次会话,返回会话 dict(由 runner 持有并持续更新)。
+
+        会话 id 带目标名:一场排多个目标时它们共用场次时间,不带目标就会撞目录。
+        """
         now = datetime.now()
-        label = str((slot or {}).get("time") or "manual").replace(":", "-")
+        def safe(text: str) -> str:
+            return re.sub(r"[^0-9A-Za-z_.-]+", "-", str(text or "")).strip("-")
+        label = safe((slot or {}).get("time") or "manual")
+        tid = safe((target or {}).get("id"))
         session_id = f"{now.strftime('%Y-%m-%d')}_{now.strftime('%H-%M-%S')}_{label}"
+        if tid:
+            session_id += f"_{tid}"
         session = {
             "id": session_id,
             "trigger": trigger,          # schedule | manual
             "slot": (slot or {}).get("time"),
+            "target": tid or "",
+            "target_name": str((target or {}).get("name") or tid or ""),
+            "flow": str((target or {}).get("flow") or ""),
             "started_at": _now_str(),
             "ended_at": None,
-            "status": "running",         # success|failed|need_manual|aborted|dry_run
+            "status": "running",         # success|failed|need_manual|aborted|dry_run|skipped
             "summary": "",
             "attempts": [],
         }
@@ -108,6 +120,8 @@ class SessionStore:
                     "id": data.get("id", child.name),
                     "trigger": data.get("trigger"),
                     "slot": data.get("slot"),
+                    "target": data.get("target") or "",
+                    "target_name": data.get("target_name") or "",
                     "started_at": data.get("started_at"),
                     "ended_at": data.get("ended_at"),
                     "status": data.get("status"),

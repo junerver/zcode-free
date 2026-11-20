@@ -115,7 +115,9 @@ def webhook(url: str, title: str, message: str, timeout: float = 10.0) -> tuple[
         return False, "未配置 webhook 地址"
     payload = _feishu_payload(title, message) if _is_feishu(url) else _generic_payload(title, message)
     try:
-        resp = httpx.post(url, json=payload, timeout=timeout)
+        # 同 core/vision.py:不吃环境里的代理设置,免得 NO_PROXY 写法让请求发不出去
+        with httpx.Client(trust_env=False) as client:
+            resp = client.post(url, json=payload, timeout=timeout)
     except Exception as exc:
         logger.debug(f"webhook 通知失败:{exc}")
         return False, f"请求失败:{exc}"

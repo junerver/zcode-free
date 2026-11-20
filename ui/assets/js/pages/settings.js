@@ -1,16 +1,16 @@
-/* 设置页:路径 / 重试参数 / 通知 / 数据与危险操作(全部即时保存) */
+/* 设置页:重试参数 / 运行模式 / 通知 / 数据与危险操作(全部即时保存)
+   签到目标自己的路径 / 窗口 / 周期在「签到目标」页按应用配置,这里只留全局项。 */
 (function () {
   const $ = (id) => document.getElementById(id);
   window.PAGES = window.PAGES || {};
   let loading = false;
 
   const FIELDS = [
-    'sZcodePath', 'sTitleMatch', 'sFullscreen', 'sStartupWait', 'sRestore',
-    'sRectX', 'sRectY', 'sRectW', 'sRectH',
+    'sDryRun',
     'rAttempts', 'rGap', 'rOpenTimeout', 'rSettle', 'rFocusSettle',
     'rAppReady', 'rVerifyReady', 'rVerifyWait',
     'rWatchdog', 'rUserIdle', 'rUserIdleWait',
-    'sKeepAwake', 'sNotifyDesktop', 'sWebhook', 'sKeepDays', 'sWeeklyOnce',
+    'sKeepAwake', 'sNotifyDesktop', 'sWebhook', 'sKeepDays',
   ];
 
   function numberOr(value, fallback) {
@@ -20,18 +20,7 @@
 
   function readForm() {
     return {
-      app: {
-        zcode_path: $('sZcodePath').value.trim(),
-        window_title_match: $('sTitleMatch').value.trim() || 'ZCode',
-        fullscreen: $('sFullscreen').checked,
-        startup_wait_s: Math.max(0, numberOr($('sStartupWait').value, 5)),
-        restore_window_rect: $('sRestore').checked,
-        window_rect: [
-          numberOr($('sRectX').value, 40), numberOr($('sRectY').value, 40),
-          numberOr($('sRectW').value, 1240), numberOr($('sRectH').value, 860),
-        ],
-        weekly_once: $('sWeeklyOnce').checked,
-      },
+      app: { dry_run: $('sDryRun').checked },
       retry: {
         max_attempts: Math.max(1, numberOr($('rAttempts').value, 5)),
         retry_gap_s: Math.max(1, numberOr($('rGap').value, 5)),
@@ -63,56 +52,17 @@
     }
   }
 
-  /* 本周状态行:周期标签 + 是否已领(已领则说明剩下的场次会跳过) */
-  async function refreshWeekly() {
-    const box = $('weeklyState');
-    if (!box) return;
-    try {
-      const state = await window.API.call('get_state');
-      const w = (state && state.weekly) || {};
-      if (!w.enabled) {
-        box.textContent = '每周限制已关闭';
-        return;
-      }
-      const label = w.label || '';
-      if (w.claimed) {
-        const src = w.claimed_source === 'manual' ? '手动试领'
-          : (w.claimed_slot ? w.claimed_slot + ' 场次' : '定时领取');
-        box.textContent = `${label} 已领取(${src},${w.claimed_at || ''})· 剩余场次将跳过`;
-      } else {
-        box.textContent = `${label} 尚未领取`;
-      }
-    } catch (err) {
-      box.textContent = '';
-    }
-  }
-
   window.PAGES.settings = {
     init() {
       FIELDS.forEach((id) => $(id).addEventListener('change', save));
 
-      $('btnDetect').addEventListener('click', async () => {
-        const box = $('detectResult');
-        box.classList.remove('hidden', 'ok', 'err');
-        box.textContent = '探测中(首次可能需要几秒)…';
-        try {
-          const res = await window.API.call('detect_zcode');
-          box.classList.add(res && res.ok ? 'ok' : 'err');
-          box.textContent = (res && res.message) || '未知结果';
-          if (res && res.ok) $('sZcodePath').value = res.path;
-        } catch (err) {
-          box.classList.add('err');
-          box.textContent = '探测失败:' + err.message;
-        }
-      });
-
       $('btnOpenDataDir').addEventListener('click', () => window.API.call('open_data_dir'));
 
-      $('btnClearWeekly').addEventListener('click', async () => {
-        if (!(await window.APP.confirm('确定清除本周已领记录吗?\n清除后,本周剩余的场次会照常执行(可能重复领取)。'))) return;
-        const res = await window.API.call('cleanup', { action: 'weekly' });
+      // 记账表按目标存(每个应用一条),清掉后各目标的后续场次都会照常执行
+      $('btnClearClaims').addEventListener('click', async () => {
+        if (!(await window.APP.confirm('确定清除全部领取记账吗?\n清除后,每个目标本周期的剩余场次会照常执行(可能重复领取)。'))) return;
+        const res = await window.API.call('cleanup', { action: 'claims' });
         window.APP.toast((res && res.message) || '已清除', 'ok');
-        await refreshWeekly();
         window.APP.refreshState();
       });
 
@@ -178,14 +128,7 @@
         const data = await window.API.call('get_settings');
         const app = data.app || {};
         const retry = data.retry || {};
-        $('sZcodePath').value = app.zcode_path || '';
-        $('sTitleMatch').value = app.window_title_match || 'ZCode';
-        $('sFullscreen').checked = app.fullscreen !== false;
-        $('sStartupWait').value = app.startup_wait_s != null ? app.startup_wait_s : 5;
-        $('sRestore').checked = app.restore_window_rect !== false;
-        const rect = app.window_rect || [40, 40, 1240, 860];
-        $('sRectX').value = rect[0]; $('sRectY').value = rect[1];
-        $('sRectW').value = rect[2]; $('sRectH').value = rect[3];
+        $('sDryRun').checked = !!app.dry_run;
         $('rAttempts').value = retry.max_attempts != null ? retry.max_attempts : 5;
         $('rGap').value = retry.retry_gap_s != null ? retry.retry_gap_s : 5;
         $('rOpenTimeout').value = retry.open_timeout_s != null ? retry.open_timeout_s : 30;
@@ -198,12 +141,10 @@
         $('rUserIdle').value = retry.user_idle_s != null ? retry.user_idle_s : 1;
         $('rUserIdleWait').value = retry.user_idle_wait_s != null ? retry.user_idle_wait_s : 20;
         $('sKeepAwake').checked = (data.schedule || {}).keep_awake !== false;
-        $('sWeeklyOnce').checked = (data.app || {}).weekly_once !== false;
         $('sNotifyDesktop').checked = (data.notify || {}).desktop !== false;
         $('sWebhook').value = (data.notify || {}).webhook_url || '';
         $('sKeepDays').value = (data.data || {}).keep_days != null ? data.data.keep_days : 7;
         $('configPathText').textContent = data.config_path || '';
-        await refreshWeekly();
       } catch (err) {
         window.APP.toast('读取设置失败:' + err.message, 'err');
       } finally {

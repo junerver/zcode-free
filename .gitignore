@@ -43,3 +43,6 @@ ui/demos/_design/out/packaged/
 dist/
 build/pyi/
 build/_icon_*.png
+
+# 部署备份(含 config.yaml 明文 Key 与实机截图)
+deploy-backup/

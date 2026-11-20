@@ -1,6 +1,7 @@
 /* 应用入口:标签页、顶栏状态、24 小时轨道、事件总线、Toast / 灯箱 / 确认框 */
 (function () {
   const $ = (id) => document.getElementById(id);
+  // 视觉流程的相位名;固定坐标流程用后端 current.steps 覆盖(见 buildSteps)
   const STEPS = ['打开客户端', '识别按钮', '点击领取', '校验结果', '收尾'];
   // 步骤标识沿用旧名(历史记录里也是它),只把展示文案改得更贴合现在的行为
   const STEP_LABELS = { '校验结果': '等待结果' };
@@ -151,6 +152,16 @@
 
   const MIN = 24 * 60;
 
+  // 场次的 target 是 id,轨道标题与提示要显示名字;留空表示"跑所有启用的目标"
+  function slotName(targetId) {
+    if (!targetId) return '全部目标';
+    const list = (state && state.targets) || [];
+    for (let i = 0; i < list.length; i += 1) {
+      if (list[i].id === targetId) return list[i].name || list[i].id;
+    }
+    return String(targetId);
+  }
+
   function buildTrack() {
     const axis = $('dtAxis');
     if (!axis) return;
@@ -191,19 +202,34 @@
     }
 
     trackMarks = [];
+    // 同一分钟可以排多个场次(同时间不同目标/不同星期),它们会画在同一个 x 上,
+    // 所以按分钟并成一个标记:标题列出每个目标,结果取其中最"坏"的那条。
+    const groups = {};
     slots.forEach((slot) => {
       const time = String(slot.time || '');
       const parts = time.split(':');
       if (parts.length !== 2) return;
       const minutes = Number(parts[0]) * 60 + Number(parts[1]);
       if (!Number.isFinite(minutes)) return;
+      (groups[minutes] = groups[minutes] || []).push(slot);
+    });
 
+    Object.keys(groups).forEach((minutes) => {
+      const list = groups[minutes];
+      const time = String(list[0].time || '');
+      const allOff = list.every((slot) => slot.enabled === false);
       const mark = document.createElement('span');
-      mark.className = 'dt-mark' + (slot.enabled === false ? ' off' : '');
+      mark.className = 'dt-mark' + (allOff ? ' off' : '');
       mark.style.left = (minutes / MIN) * 100 + '%';
       mark.dataset.time = time;
-      mark.title = time + (slot.enabled === false ? ' · 未启用' : '') +
-        (slot.attempts != null ? ' · 覆盖尝试 ' + slot.attempts + ' 次' : '');
+      // keys:记录回填用的索引(时间 + 目标),与 applyTrackResults 保持一致
+      mark.dataset.keys = list.map((slot) =>
+        time + '|' + (slot.target || '')).join(',');
+      const names = list.map((slot) => slotName(slot.target));
+      mark.title = time + (allOff ? ' · 未启用' : '') +
+        ' · ' + names.join(' / ') +
+        (list.length > 1 ? '(' + list.length + ' 个场次)' : '') +
+        (list[0].attempts != null ? ' · 覆盖尝试 ' + list[0].attempts + ' 次' : '');
       mark.innerHTML = '<span class="pin"></span><span class="dot"></span>' +
         '<span class="lbl mono"></span><span class="out mono"></span>';
       mark.querySelector('.lbl').textContent = time;
@@ -225,19 +251,28 @@
     const d = new Date();
     const pad = (n) => String(n).padStart(2, '0');
     const todayStr = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-    const byTime = {};
+    const byKey = {};
     (items || []).forEach((item) => {
-      const slot = item.slot;
-      if (!slot || byTime[slot]) return;
+      if (!item.slot) return;
+      const key = item.slot + '|' + (item.target || '');
+      if (byKey[key]) return;
       if (!String(item.started_at || '').startsWith(todayStr)) return;
-      byTime[slot] = item;
+      byKey[key] = item;
     });
+    // 并成一个标记的多个场次:取最坏的那条结果,免得成功的那条把失败盖掉
+    const SEVERITY = ['failed', 'aborted', 'need_manual', 'not_available', 'skipped', 'dry_run', 'success'];
     trackMarks.forEach((mark) => {
-      const rec = byTime[mark.dataset.time];
       const out = mark.querySelector('.out');
-      if (!rec) { out.textContent = ''; out.className = 'out mono'; return; }
-      const info = window.UITL.statusInfo(rec.status);
-      out.textContent = info.text;
+      const recs = String(mark.dataset.keys || '').split(',')
+        .filter(Boolean).map((key) => byKey[key]).filter(Boolean);
+      if (!recs.length) { out.textContent = ''; out.className = 'out mono'; return; }
+      let picked = recs[0];
+      SEVERITY.forEach((status) => {
+        const hit = recs.find((rec) => rec.status === status);
+        if (hit) picked = hit;
+      });
+      const info = window.UITL.statusInfo(picked.status);
+      out.textContent = info.text + (recs.length > 1 ? ' ' + recs.length + ' 项' : '');
       out.className = 'out mono ' + (info.cls === 'ok' ? 'ok' : (info.cls === 'fail' ? 'fail' : ''));
     });
   }
@@ -262,17 +297,21 @@
 
   /* ---------- 执行步骤条 ---------- */
 
-  function buildSteps() {
+  function buildSteps(phases) {
     const box = $('steps');
+    const names = (phases && phases.length ? phases : STEPS);
+    const signature = names.join('|');
+    if (buildSteps.signature === signature && box.hasChildNodes()) return;
+    buildSteps.signature = signature;
     box.innerHTML = '';
-    STEPS.forEach((name, index) => {
+    names.forEach((name, index) => {
       const el = document.createElement('span');
       el.className = 'step';
       el.dataset.step = name;
       el.innerHTML = '<span class="circle">•</span><span class="label">' +
         (STEP_LABELS[name] || name) + '</span>';
       box.appendChild(el);
-      if (index < STEPS.length - 1) {
+      if (index < names.length - 1) {
         const arrow = document.createElement('span');
         arrow.className = 'step-arrow';
         arrow.textContent = '→';
@@ -288,6 +327,23 @@
       if (status) el.classList.add(status);
       el.querySelector('.circle').textContent = status === 'ok' ? '✓' : (status === 'fail' ? '✕' : '•');
     });
+  }
+
+  /* ---------- 执行中的表头与步骤条 ---------- */
+
+  /* 一次场次可能挨个跑多个目标,所以「本次执行」的表头要写清是哪个目标、第几个。
+     current 里没有 flow/steps 时(旧记录、后端刚起),退回默认的视觉五步。 */
+  function renderRunningHeader() {
+    const box = $('liveTarget');
+    if (!box) return;
+    const cur = (state && state.current) || null;
+    if (!cur) { box.textContent = '未运行'; return; }
+    const name = cur.target_name || cur.target || '';
+    const total = Number(cur.targets_total) || 1;
+    const index = Number(cur.target_index) || 1;
+    box.textContent = name + (total > 1 ? ' ' + index + '/' + total : '');
+    box.title = (cur.slot ? '场次 ' + cur.slot + ' · ' : '') +
+      (cur.flow === 'steps' ? '固定坐标流程' : '视觉识别流程');
   }
 
   /* ---------- 状态刷新 ---------- */
@@ -309,14 +365,18 @@
       execRunningAt = 0;
     }
     renderTopbar();
+    buildSteps(state.current && state.current.steps);
     renderSteps();
-    // 场次数量/启用状态/星期变化,或跨天(今天该画的场次不同)时重建轨道;
+    renderRunningHeader();
+    // 场次数量/启用状态/星期/指向的目标变化,或跨天(今天该画的场次不同)时重建轨道;
     // 否则只回填结果
     const today = new Date();
     const signature = ((state.slots || []).map((s) =>
       s.time + (s.enabled === false ? '0' : '1') +
-      ((s.days && s.days.length) ? s.days.join('') : 'a')).join(',')) +
+      ((s.days && s.days.length) ? s.days.join('') : 'a') +
+      '#' + (s.target || '')).join(',')) +
       '@' + (today.getDay() + 6) % 7 +
+      '>' + ((state.targets || []).map((t) => t.id + ':' + t.name).join(',')) +
       '|' + ((state.recent || []).map((r) => r.id || r.slot).join(','));
     if (signature !== buildTrack.signature) {
       buildTrack.signature = signature;
@@ -337,7 +397,7 @@
       alertState = null;
       freshResult = null;
       clearTimeout(freshTimer);
-      // 本周已领到的跳过场次不碰客户端,不做"执行中"那套提示,免得看起来像在跑
+      // 本周期已领到的跳过场次不碰客户端,不做"执行中"那套提示,免得看起来像在跑
       if (event && event.skipped) {
         execRunning = false;
         execRunningAt = 0;
@@ -351,8 +411,10 @@
       $('livePanel').classList.remove('hidden');
       $('liveSession').textContent = (event && event.session_id) || '';
       $('liveMsg').textContent = '已开始,正在打开客户端…';
+      buildSteps(event && event.steps);
       renderSteps();
-      showBanner('执行中:请勿让浏览器窗口遮挡 ZCode(可最小化本窗口,自动化会把 ZCode 切到前台)', false);
+      renderRunningHeader();
+      showBanner('执行中:请勿让浏览器窗口遮挡目标应用(可最小化本窗口,自动化会把它切到前台)', false);
       if (event && event.trigger === 'manual') switchTab('logs');
       refreshState();
     });
@@ -398,33 +460,35 @@
       execRunning = false;
       execRunningAt = 0;
       $('banner').classList.add('hidden');   // 先收起执行提示,失败时再弹告警
+      // 一场可能连跑多个目标,每条结果都要带上是哪个目标,否则只能看见"成功了"几次
+      const who = event.target_name ? '[' + event.target_name + '] ' : '';
       const detail = event.summary || '';
       if (event.status === 'success') {
         alertState = null;
         setFreshResult('success');
-        toast('领取成功' + (detail ? ':' + detail : ''), 'ok');
+        toast(who + '领取成功' + (detail ? ':' + detail : ''), 'ok');
       } else if (event.status === 'not_available') {
         // 当期没有可领的福利是正常结果,不是失败:挂个提示但不算告警
         alertState = { type: 'manual', text: detail };
-        showBanner((event.slot ? '[' + event.slot + '] ' : '') + '本次无需领取:' + detail, false);
-        toast('本次无需领取');
+        showBanner(who + '本次无需领取:' + detail, false);
+        toast(who + '本次无需领取');
       } else if (event.status === 'skipped') {
-        // 本周已领到,剩余场次静默跳过:只在日志里留痕,不弹告警
+        // 本周期已领到(按每个目标自己的每天/每周),剩余场次静默跳过:只在日志里留痕,不弹告警
         alertState = null;
-        toast((event.slot ? '[' + event.slot + '] ' : '') + '本周已领取,本场跳过');
+        toast(who + '本周期已领取,本场跳过');
       } else if (event.status === 'need_manual') {
         alertState = { type: 'manual', text: detail };
-        showBanner('需要人工处理:' + detail, true);
-        toast('需要人工处理,详情见运行日志', 'err');
+        showBanner(who + '需要人工处理:' + detail, true);
+        toast(who + '需要人工处理,详情见运行日志', 'err');
       } else if (event.status === 'failed') {
         alertState = { type: 'err', text: detail };
-        showBanner((event.slot ? '[' + event.slot + '] ' : '') + '领取失败:' + detail, true);
-        toast('领取失败,详情见运行日志', 'err');
+        showBanner(who + '领取失败:' + detail, true);
+        toast(who + '领取失败,详情见运行日志', 'err');
       } else if (event.status === 'aborted') {
         alertState = { type: 'err', text: detail };
-        toast('已中止,详情见运行日志', 'err');
+        toast(who + '已中止,详情见运行日志', 'err');
       } else {
-        toast('演练完成,详情见运行日志');
+        toast(who + '演练完成,详情见运行日志');
       }
       refreshState();
     });

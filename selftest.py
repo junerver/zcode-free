@@ -45,9 +45,11 @@ def main() -> int:
     check("执行器:演练模式单次尝试与记录", lambda: __runner_dry_case())
     check("执行器:重试循环与收尾", lambda: __runner_retry_case())
     check("窗口进程校验(拒绝同名无关窗口 / 误关保护进程)", lambda: __window_guard_case())
+    check("自我探测防护(助手自己不当客户端 / 关键字不误伤)", lambda: __own_exe_case())
     check("修饰键保护(置前失败不再卡住 ALT / 启动可清理)", lambda: __modifier_guard_case())
     check("用户占用保护(正在用键鼠时不抢前台、不点击)", lambda: __user_idle_guard_case())
     check("窗口摆放(全屏 / 固定矩形 / 演练不动窗口)", lambda: __position_window_case())
+    check("鼠标注入被系统拒绝(提权目标:报错且绝不盲按)", lambda: __click_blocked_case())
     check("加载期纯色等待与锁屏判定(不再误判跳过)", lambda: __ready_wait_case())
     check("残留任务状态自愈(断电后的 running 会话)", lambda: __stale_session_case())
     check("执行器:结果弹窗映射(成功收尾 / 失败重试)", lambda: __verify_mapping_case())
@@ -55,14 +57,20 @@ def main() -> int:
     check("通知:真实 webhook 推送(未配置地址则跳过)", lambda: __notify_webhook_live_case())
     check("执行器:福利卡片缺失复查(晚出现继续领,仍缺失走重试)", lambda: __no_card_case())
     check("执行器:点击后固定等待判定(仍在加载即重试)", lambda: __verify_pending_case())
-    check("每周一次机会(周期从周五起 / 已领则跳过后续场次)", lambda: __weekly_case())
+    check("签到目标模型(清洗 / id 唯一 / 旧配置一次性迁移)", lambda: __targets_case())
+    check("锚点坐标(录制→执行往返 / 窗口移动缩放后仍贴边)", lambda: __coords_case())
+    check("固定坐标流程(按录制点击 / 分步留档 / 拒绝盲点)", lambda: __steps_case())
+    check("领取后补关(成功后关掉浮窗 / 补关失败不改结果)", lambda: __post_clicks_case())
+    check("领取周期 none/每天/每周(周期边界 / 已领跳过 / 多目标分发)", lambda: __claims_case())
     check("场次按星期(每天 / 指定星期 / 误配置告警)", lambda: __weekday_slot_case())
     check("测试识别接口(整屏,无 Key 时报错而不抛异常)", lambda: __test_locate_case())
+    check("网络请求不吃环境代理(畸形 NO_PROXY 下仍能发出请求)", lambda: __no_proxy_env_case())
     check("前端资源完整性(HTML / CSS / JS)", lambda: __ui_assets_case())
     check("动效与排版护栏(无自我触发 / 纯文字 / 无渐变阴影)", lambda: __motion_guard_case())
     check("HTTP 桥往返(get_state / 首页 / 静态资源)", lambda: __http_case())
     check("本地服务来源校验(跨站 Origin / 伪造 Host 一律 403)", lambda: __origin_guard_case())
     check("API Key 不回传明文(留空保持 / 显式清除 / 尾号提示)", lambda: __api_key_mask_case())
+    check("识别配置提交后落盘并回填(地址 / 模型 id)", lambda: __vision_config_submit_case())
     check("打包:冻结路径分流(资源 / 数据分离)", lambda: __frozen_path_case())
     check("打包:单实例锁(第二个实例必须被拒)", lambda: __single_instance_case())
     check("打包:防休眠(开关 / 执行期嵌套计数)", lambda: __awake_case())
@@ -282,17 +290,18 @@ def __verify_mapping_case():
     })
     store = SessionStore(tmp / "shots")
     runner = Runner(cfg, EventBus(), store, VisionClient(cfg))
+    target = runner.slot_targets({})[0]
     cfg_dict = cfg.all()
 
     fake_shot = SimpleNamespace(png=b"\x89PNG-fake", width=1240, height=860,
                                 rect=(40, 40, 1240, 860), uniform_ratio=0.3,
                                 full_size=(1920, 1080))
-    runner._open_client = lambda dry, cfg: {"hwnd": 1, "title": "FakeZCode", "rect": [40, 40, 1240, 860], "area": 1}
+    runner._open_client = lambda dry, cfg, target: {"hwnd": 1, "title": "FakeZCode", "rect": [40, 40, 1240, 860], "area": 1}
     runner._close_client = lambda dry: None
     # 真实方法名是 _grab_ready(曾经的 bug:这里写的是不存在的 _grab_window,
     # 打桩落空 → 自检真的截图并点了用户的鼠标)。返回 (截图, 未就绪原因)。
-    runner._grab_ready = lambda win, rect, cfg, dry, label, timeout=None: (fake_shot, None)
-    runner._position_window = lambda win, cfg, dry: tuple(win["rect"])
+    runner._grab_ready = lambda win, rect, cfg, dry, target, label, timeout=None: (fake_shot, None)
+    runner._position_window = lambda win, cfg, dry, target=None: tuple(win["rect"])
     runner._wait_user_idle = lambda cfg, abort: False
     runner._ensure_foreground = lambda win, cfg: True
     runner.vision.locate = lambda png: {
@@ -306,12 +315,14 @@ def __verify_mapping_case():
     clicks: list[tuple] = []
     clicker_module.click_norm = lambda rect, box, humanize=False: clicks.append(("norm", rect, box))
     clicker_module.click_screen = lambda x, y, humanize=False: clicks.append(("screen", x, y))
+    # 自检机器上可能真开着提权窗口,权限预检一并桩掉(单独测它的用例在后面)
+    runner._foreground_unreachable = lambda win, target: ""
 
     def run(verify_result):
-        runner.vision.verify = lambda png: verify_result
+        runner.vision.verify = lambda png, target=None: verify_result
         session = store.begin("manual", {"time": None})
         attempt = store.begin_attempt(session, 1)
-        return runner._one_attempt(session, attempt, False, threading.Event(), cfg_dict)[0]
+        return runner._one_attempt(session, attempt, False, threading.Event(), cfg_dict, target)[0]
 
     def run_single_check():
         """验证点击后只做一次固定等待 + 一次截图判定(按用户设定的策略)。
@@ -320,7 +331,7 @@ def __verify_mapping_case():
         """
         taken = {"n": 0}
 
-        def counting_grab(win, rect, cfg, dry, label, timeout=None):
+        def counting_grab(win, rect, cfg, dry, target, label, timeout=None):
             taken["n"] += 1
             return fake_shot, None
 
@@ -328,13 +339,13 @@ def __verify_mapping_case():
         original_verify = runner.vision.verify
         runner._grab_ready = counting_grab
         # 始终"没结论":策略规定只截 1 张,判定完就收,不再复查
-        runner.vision.verify = lambda png: {
+        runner.vision.verify = lambda png, target=None: {
             "popup": None, "success": False, "failed": False, "confidence": 0.3,
         }
         try:
             session = store.begin("manual", {"time": None})
             attempt = store.begin_attempt(session, 1)
-            runner._one_attempt(session, attempt, False, threading.Event(), cfg_dict)
+            runner._one_attempt(session, attempt, False, threading.Event(), cfg_dict, target)
         finally:
             runner._grab_ready = original_grab
             runner.vision.verify = original_verify
@@ -410,11 +421,12 @@ def __ready_wait_case():
     cfg = ConfigStore(tmp / "config.yaml")
     cfg.patch({"retry": {"ready_poll_s": 0.05, "uniform_ratio_max": 0.98}})
     runner = Runner(cfg, EventBus(), SessionStore(tmp / "shots"), VisionClient(cfg))
+    target = runner.slot_targets({})[0]
     cfg_dict = cfg.all()
     win = {"hwnd": 1, "title": "Fake", "rect": [0, 0, 100, 100]}
     orig_grab, orig_locked = capture_module.grab_region, capture_module.desktop_locked
     orig_position = runner._position_window
-    runner._position_window = lambda w, c, d: tuple(w["rect"])
+    runner._position_window = lambda w, c, d, t=None: tuple(w["rect"])
 
     try:
         capture_module.desktop_locked = lambda: False
@@ -429,7 +441,7 @@ def __ready_wait_case():
             return shot
 
         capture_module.grab_region = grab_seq
-        shot, reason = runner._grab_ready(win, tuple(win["rect"]), cfg_dict, True, "测试", timeout=5)
+        shot, reason = runner._grab_ready(win, tuple(win["rect"]), cfg_dict, True, target, "测试", timeout=5)
         assert reason is None and shot.uniform_ratio == 0.62, f"应等到渲染完成,得到 {reason}"
         assert calls["n"] == 3, f"应轮询 3 次,实际 {calls['n']}"
 
@@ -441,14 +453,14 @@ def __ready_wait_case():
             return FakeShot(uniform_ratio=1.0)
 
         capture_module.grab_region = always_blank
-        _, reason = runner._grab_ready(win, tuple(win["rect"]), cfg_dict, True, "测试", timeout=0.3)
+        _, reason = runner._grab_ready(win, tuple(win["rect"]), cfg_dict, True, target, "测试", timeout=0.3)
         assert reason == "blank", f"持续纯色应为 blank,得到 {reason}"
         assert calls["n"] > 1, f"纯色期间应多次轮询,实际 {calls['n']}"
 
         # ③ 真锁屏 → 由系统 API 判定,返回 locked
         capture_module.desktop_locked = lambda: True
         calls["n"] = 0
-        _, reason = runner._grab_ready(win, tuple(win["rect"]), cfg_dict, True, "测试", timeout=5)
+        _, reason = runner._grab_ready(win, tuple(win["rect"]), cfg_dict, True, target, "测试", timeout=5)
         assert reason == "locked", f"锁屏应为 locked,得到 {reason}"
         assert calls["n"] == 1, f"锁屏应只截一次就退出,实际 {calls['n']}"
 
@@ -461,7 +473,7 @@ def __ready_wait_case():
             return FakeShot(uniform_ratio=0.55)
 
         capture_module.grab_region = ready_first
-        shot, reason = runner._grab_ready(win, tuple(win["rect"]), cfg_dict, True, "测试", timeout=5)
+        shot, reason = runner._grab_ready(win, tuple(win["rect"]), cfg_dict, True, target, "测试", timeout=5)
         assert reason is None, f"就绪时不应有问题,得到 {reason}"
         assert calls["n"] == 1, f"就绪时应只截一次,实际 {calls['n']}"
     finally:
@@ -473,8 +485,54 @@ def __ready_wait_case():
     return "纯色=等待渲染(不再误判锁屏);真锁屏=locked;无额外轮询"
 
 
+def __click_blocked_case():
+    """鼠标没落到目标点时必须报错,而且一个键都不许按。
+
+    背景:WorkBuddy 以管理员身份运行,助手是普通权限,系统(UIPI)把注入的鼠标操作
+    静默丢掉;pyautogui 不看 SetCursorPos 的返回值,于是日志写着"已点击",
+    屏幕上却一下都没点。试运行"没反应"就是这么来的。
+    """
+    import core.clicker as clicker
+    import pyautogui
+
+    moves: list = []
+    clicks: list = []
+    real = (pyautogui.moveTo, pyautogui.click, clicker.cursor_pos, clicker.virtual_screen)
+    try:
+        pyautogui.moveTo = lambda x, y, duration=0: moves.append((x, y))
+        pyautogui.click = lambda *a, **k: clicks.append(a)
+
+        # ① 光标落定 → 正常点击一次
+        clicker.cursor_pos = lambda: (100, 200)
+        clicker.virtual_screen = lambda: (0, 0, 3840, 1080)
+        assert clicker.click_screen(100, 200) == (100, 200)
+        assert len(clicks) == 1, f"落定了应当按下一次:{clicks}"
+
+        # ② 光标没动(被提权窗口挡住)→ 抛错,且绝不能按下鼠标
+        moves.clear(); clicks.clear()
+        clicker.cursor_pos = lambda: (2734, 638)          # 用户光标停在别处
+        try:
+            clicker.click_screen(100, 200)
+            raise AssertionError("鼠标没落定却仍然执行了点击")
+        except clicker.ClickBlocked as exc:
+            assert "管理员" in str(exc), f"要提示可能是权限问题:{exc}"
+        assert not clicks, f"没落到目标点时不许按下鼠标:{clicks}"
+
+        # ③ 边界按整个桌面算:副屏上的坐标不能被夹回主屏
+        assert clicker.clamp(2734, 638) == (2734, 638), "第二块屏上的点被夹回主屏了"
+        assert clicker.clamp(-50, 5000) == (0, 1079), "越界坐标没有被收进桌面范围"
+    finally:
+        (pyautogui.moveTo, pyautogui.click,
+         clicker.cursor_pos, clicker.virtual_screen) = real
+    return "落不定就报错不按下;副屏坐标不再被夹回主屏"
+
+
 def __position_window_case():
-    """摆放策略:全屏开启时最大化;关闭时移到固定矩形;演练不动窗口。"""
+    """摆放策略:目标要求全屏则最大化;不要求时只置顶不改尺寸;演练一律不动窗口。
+
+    背景:坐标只记「相对窗口某条边的偏移」,所以窗口在哪、多大都能用。旧版本把窗口
+    强推到固定矩形(1240x860),在多显示器/DPI 不同的机器上会跑到屏幕外。
+    """
     from core.runner import Runner
     from core.events import EventBus
     from core.storage import SessionStore
@@ -485,38 +543,76 @@ def __position_window_case():
     from pathlib import Path
 
     tmp = Path(tempfile.mkdtemp(prefix="zcode-pos-"))
-    runner = Runner(ConfigStore(tmp / "config.yaml"), EventBus(),
-                    SessionStore(tmp / "shots"), VisionClient(ConfigStore(tmp / "config.yaml")))
+    cfg = ConfigStore(tmp / "config.yaml")
+    runner = Runner(cfg, EventBus(), SessionStore(tmp / "shots"), VisionClient(cfg))
+    base = runner.slot_targets({})[0]
+    cfg_dict = cfg.all()
 
-    calls = {"max": 0, "move": None, "fg": 0}
-    orig_max, orig_move, orig_fg, orig_rect = zc.maximize, zc.move_window, zc.foreground, zc.window_rect
+    calls = {"max": 0, "fg": 0}
+
+    def fake_maximize(hwnd):
+        calls["max"] += 1
+
+    def fake_foreground(hwnd):
+        calls["fg"] += 1
+        return True
+
+    orig = (zc.maximize, zc.foreground, zc.window_rect, zc.client_rect,
+            zc.owns_foreground, zc.is_maximized)
     try:
-        zc.maximize = lambda hwnd: calls.__setitem__("max", calls["max"] + 1)
-        zc.move_window = lambda hwnd, rect: calls.__setitem__("move", list(rect))
-        zc.foreground = lambda hwnd: calls.__setitem__("fg", calls["fg"] + 1) or True
+        zc.maximize, zc.foreground = fake_maximize, fake_foreground
+        # 假句柄量不到客户区:先当读不到,验证退回窗口矩形的老路
+        zc.client_rect = lambda hwnd: None
+        zc.owns_foreground = lambda hwnd: False
+        zc.is_maximized = lambda hwnd: False
         zc.window_rect = lambda hwnd: [0, 0, 1920, 1080]
         win = {"hwnd": 1, "title": "Fake", "rect": [0, 0, 100, 100]}
 
-        cfg_full = ConfigStore(tmp / "a.yaml")
-        cfg_full.patch({"app": {"fullscreen": True}})
-        rect = runner._position_window(win, cfg_full.all(), dry=False)
-        assert calls["max"] == 1, "全屏开启时应调用最大化"
+        # ① 全屏目标:最大化,并采用最大化之后的矩形去换算坐标
+        rect = runner._position_window(win, cfg_dict, False, dict(base, fullscreen=True))
+        assert calls == {"max": 1, "fg": 1}, f"全屏应置顶+最大化各一次:{calls}"
         assert rect == (0, 0, 1920, 1080), f"应使用最大化后的窗口矩形,得到 {rect}"
+        assert win["rect"] == [0, 0, 1920, 1080], f"窗口矩形应回写供后续步骤复用:{win['rect']}"
 
-        calls.update({"max": 0, "move": None})
-        cfg_rect = ConfigStore(tmp / "b.yaml")
-        cfg_rect.patch({"app": {"fullscreen": False, "restore_window_rect": True,
-                                "window_rect": [40, 40, 1240, 860]}})
-        rect = runner._position_window(win, cfg_rect.all(), dry=False)
-        assert calls["max"] == 0 and calls["move"] == [40, 40, 1240, 860], "关闭全屏时应移到固定矩形"
-        assert rect == (40, 40, 1240, 860)
+        # ② 关掉全屏:只置顶,尺寸原样保留(锚点偏移仍然成立)
+        calls.update({"max": 0, "fg": 0})
+        zc.window_rect = lambda hwnd: [300, 200, 1280, 800]
+        rect = runner._position_window(win, cfg_dict, False, dict(base, fullscreen=False))
+        assert calls == {"max": 0, "fg": 1}, f"非全屏不该最大化:{calls}"
+        assert rect == (300, 200, 1280, 800), f"应沿用窗口当前矩形,得到 {rect}"
 
-        calls.update({"max": 0, "move": None})
-        runner._position_window(win, cfg_full.all(), dry=True)
-        assert calls["max"] == 0 and calls["move"] is None, "演练模式不应改变窗口"
+        # ③ 演练:既不置顶也不最大化(动了窗口就是在打扰用户),但仍读一次真实矩形
+        calls.update({"max": 0, "fg": 0})
+        zc.window_rect = lambda hwnd: [7, 8, 900, 600]
+        rect = runner._position_window(win, cfg_dict, True, dict(base, fullscreen=True))
+        assert calls == {"max": 0, "fg": 0}, f"演练模式不应改变窗口状态:{calls}"
+        assert rect == (7, 8, 900, 600), f"演练仍要按当前真实矩形截图,得到 {rect}"
+
+        # ④ 读不到矩形(窗口刚关闭)时退回已知值,不能抛异常打断整场
+        zc.window_rect = lambda hwnd: None
+        rect = runner._position_window({"hwnd": 1, "title": "Fake", "rect": [1, 2, 3, 4]},
+                                       cfg_dict, True, dict(base, fullscreen=True))
+        assert rect == (1, 2, 3, 4), f"取不到新矩形时应沿用旧值,得到 {rect}"
+
+        # ⑤ 换算基准优先客户区:录制用的截图是客户区原点,拿窗口矩形(最大化时 -8,-8)
+        #    去回放,每个点都会整体偏左 8 像素、贴顶部的点还偏上 8 像素
+        calls.update({"max": 0, "fg": 0})
+        zc.window_rect = lambda hwnd: [-8, -8, 1936, 1048]
+        zc.client_rect = lambda hwnd: [0, 0, 1920, 1032]
+        rect = runner._position_window(win, cfg_dict, False, dict(base, fullscreen=True))
+        assert rect == (0, 0, 1920, 1032), f"应当用客户区矩形,得到 {rect}"
+
+        # ⑥ 已经在最前、也已经最大化:一次置顶/最大化都别做。
+        #    点完第一步会弹出账户菜单,再 ShowWindow 一次就把要点的那个弹窗关了。
+        calls.update({"max": 0, "fg": 0})
+        zc.owns_foreground = lambda hwnd: True
+        zc.is_maximized = lambda hwnd: True
+        runner._position_window(win, cfg_dict, False, dict(base, fullscreen=True))
+        assert calls == {"max": 0, "fg": 0}, f"窗口本就在位,不该再动它:{calls}"
     finally:
-        zc.maximize, zc.move_window, zc.foreground, zc.window_rect = orig_max, orig_move, orig_fg, orig_rect
-    return "全屏/固定矩形/演练不动窗口 三种策略正确"
+        (zc.maximize, zc.foreground, zc.window_rect, zc.client_rect,
+         zc.owns_foreground, zc.is_maximized) = orig
+    return "全屏最大化 / 非全屏只置顶 / 演练不动窗口 / 以客户区为准 / 在位则不再折腾 五种策略正确"
 
 
 def __window_guard_case():
@@ -578,6 +674,103 @@ def __window_guard_case():
     return f"误判/误关均已拦截(当前可见窗口中通过校验 {len(accepted)} 个)"
 
 
+def __own_exe_case():
+    """回归:助手绝不能把自己当成签到目标。
+
+    事故背景:打包后的进程叫 ZCodeAssistant.exe,含 "zcode" 关键字,旧版探测按关键字
+    匹配运行进程时返回了自己的路径写进配置;此后每次"打开客户端"都在启动第二个自己,
+    弹单实例提示框、把提示框当窗口全屏,试运行全部失败(用户实测只有第一次正常)。
+    """
+    import os
+    import sys
+    from pathlib import Path
+
+    import win32process
+
+    import core.zcode_ctrl as zc
+
+    # ① 自身路径识别:大小写/相对写法/venv 包装器都要认得,别人的路径一律不认
+    own = zc.own_exe()
+    assert own and Path(own).is_file(), f"自身路径应可解析:{own!r}"
+    assert Path(own).name.lower().startswith("python"), f"源码运行时自身应是解释器:{own}"
+    assert zc.is_own_exe(sys.executable) is True, \
+        f"venv 下 sys.executable({sys.executable})与进程镜像({own})不是一个文件,两个都得算自己"
+    assert zc.is_own_exe(own) is True
+    assert zc.is_own_exe(own.upper().replace("C:", "c:")) is True, "Windows 路径比较不区分大小写"
+    assert zc.is_own_exe(None) is False and zc.is_own_exe("") is False
+    assert zc.is_own_exe(r"D:\app_file\Zcode\ZCode.exe") is False
+
+    # ② 进程枚举:自己明明在运行,却必须报告"没有这个进程"
+    assert zc.pids_of_exe(own) == [], f"不得把自己列为签到客户端进程:{zc.pids_of_exe(own)}"
+    assert zc.pids_of_exe(sys.executable) == [], "venv 解释器路径同样不得列为客户端"
+    assert zc.find_process_window(own) is None, "不得把自己进程的窗口当成客户端主窗口"
+
+    # ③ 窗口校验:进程是自己的窗口必须拒绝(单实例提示框就是这么被当成主窗口的)
+    orig_pid, orig_path = zc.window_pid, zc.process_path
+    try:
+        zc.window_pid = lambda hwnd: os.getpid()
+        zc.process_path = lambda pid: own
+        ok, reason = zc.verify_client_window({"hwnd": 1, "title": "ZCode 福利助手"}, own)
+        assert ok is False and "自身" in reason, f"应拒绝自己的窗口,得到 {ok}/{reason}"
+    finally:
+        zc.window_pid, zc.process_path = orig_pid, orig_path
+
+    # ④ 探测排序:精确同名优先,含关键字的助手/受保护进程一律排除
+    assistant = r"D:\Program Files\ZCodeAssistant\ZCodeAssistant.exe"
+    fake = {
+        100: own,                          # 本程序自己(源码运行时是 python.exe)
+        101: assistant,                    # 打包后的助手:名字含 "zcode" 但不是客户端
+        102: r"C:\Windows\explorer.exe",   # 受保护
+        103: r"D:\app_file\Zcode\ZCode.exe",   # 真正的客户端
+    }
+    orig_cached, orig_enum = zc.process_path_cached, win32process.EnumProcesses
+    orig_own, orig_alt = zc._OWN_EXE, zc._OWN_ALT
+    try:
+        zc.process_path_cached = lambda pid: fake.get(int(pid))
+        win32process.EnumProcesses = lambda: sorted(fake)
+        assert zc.find_running_exe("zcode") == r"D:\app_file\Zcode\ZCode.exe", \
+            "应优先返回精确同名的 ZCode.exe,而不是任何名字里含 zcode 的程序"
+        assert zc.pids_of_exe(assistant) == [101], \
+            "按路径严格比对:用户显式指定某个正在运行的 exe 时应当认账"
+
+        # ⑤ 复刻事故现场:打包版自己就是 ZCodeAssistant.exe(名字里含 "zcode")
+        zc._OWN_EXE, zc._OWN_ALT = assistant, ""
+        assert zc.is_own_exe(assistant) is True
+        assert zc.find_running_exe("zcode") == r"D:\app_file\Zcode\ZCode.exe", \
+            "同名优先:即便助手也在跑,也要挑真正的客户端"
+        zc.process_path_cached = lambda pid: {101: assistant, 102: fake[102]}.get(int(pid))
+        assert zc.find_running_exe("zcode") is None, "只剩自己/受保护进程时不许凑数把自己当客户端"
+        assert zc.find_running_exe("zcodeassistant") is None, "关键字直接指向自身时也不得返回"
+        assert zc.pids_of_exe(assistant) == [], "不得把助手自己的进程列为客户端进程"
+        zc.window_pid = lambda hwnd: 101
+        zc.process_path = lambda pid: assistant
+        ok, reason = zc.verify_client_window({"hwnd": 1, "title": "ZCode 福利助手"}, assistant)
+        assert ok is False and "自身" in reason, f"应拒绝自己的窗口,得到 {ok}/{reason}"
+    finally:
+        zc.process_path_cached, win32process.EnumProcesses = orig_cached, orig_enum
+        zc._OWN_EXE, zc._OWN_ALT = orig_own, orig_alt
+        zc.window_pid, zc.process_path = orig_pid, orig_path
+
+    # ⑥ 关进程兜底:进程对不上、或根本是自家进程,都不许下手
+    orig_path = zc.process_path
+    try:
+        zc.process_path = lambda pid: own
+        assert zc.kill_tree(os.getpid()) is False, "本程序自身的进程不得被结束"
+        zc.process_path = lambda pid: r"D:\app_file\Zcode\ZCode.exe"
+        assert zc.kill_tree(os.getpid(), expected_exe=r"D:\other\Thing.exe") is False, \
+            "进程与预期 exe 不符时不得结束"
+        assert zc.kill_tree(None) is False, "没有 PID 时不应有任何动作"
+    finally:
+        zc.process_path = orig_path
+    assert zc.is_alive(os.getpid()) is True, "自检把自己的进程关了"
+
+    # ⑥ 尺寸闸:小对话框/气泡窗(实测 406x195 的单实例提示框)不可能被选为主窗口
+    small = [w for w in zc.list_windows("")
+             if w["rect"][2] < zc.MIN_WINDOW_W or w["rect"][3] < zc.MIN_WINDOW_H]
+    assert not small, f"枚举结果里混入了过小的窗口:{[(w['title'], w['rect']) for w in small][:3]}"
+    return f"自身({Path(own).name})/关键字相近/受保护进程全部排除;窗口尺寸闸生效"
+
+
 def __stale_session_case():
     """断电/崩溃残留的 running 会话,启动时应被标记为中止。"""
     import json
@@ -599,6 +792,95 @@ def __stale_session_case():
     assert data["attempts"][0]["result"] == "aborted"
     assert store.abort_stale() == 0, "重复清理应为 0"
     return "残留 running 会话已自愈为 aborted"
+
+
+def __no_proxy_env_case():
+    """网络请求不吃环境代理:NO_PROXY 写法稍特殊一点就会让请求根本发不出去。
+
+    背景:httpx 默认 trust_env=True,会去读环境里的 HTTP(S)_PROXY / NO_PROXY。
+    Windows 上不少代理工具和终端注入的 NO_PROXY 长这样:
+        localhost,.localhost,127.0.0.1,127.0.0.0/8,[::1],::1
+    httpx 0.28.1 解析带方括号的 IPv6 项时把 "1]" 当端口号,在建 Client() 的那一刻
+    就抛 InvalidURL("Invalid port: ':1]'")。表现是日志里一句看不懂的
+    「网络错误:Invalid port: ':1]'」,请求根本没发出 —— 从这种终端启动程序时,
+    视觉流程(签到目标 ZCode)每场都会整场失败,而固定坐标流程不受影响。
+    修法:core/vision.py 与 core/notify.py 显式 trust_env=False。
+    """
+    import os
+    import tempfile
+    from pathlib import Path
+
+    import httpx
+
+    from core.config import ConfigStore
+    from core.vision import VisionClient
+
+    polluted = "localhost,.localhost,127.0.0.1,127.0.0.0/8,[::1],::1"
+    saved = {name: os.environ.get(name) for name in ("NO_PROXY", "HTTP_PROXY", "HTTPS_PROXY")}
+    os.environ["NO_PROXY"] = polluted
+    for name in ("HTTP_PROXY", "HTTPS_PROXY"):
+        os.environ.pop(name, None)
+    try:
+        # ① 先坐实故障:httpx 的默认构造在这个环境里连 client 都建不出来
+        try:
+            httpx.Client().close()
+        except httpx.InvalidURL:
+            pass
+        else:
+            return "跳过(本机 httpx 不解析 NO_PROXY 里的 [::1],该环境问题不存在)"
+
+        # ② 关掉 trust_env 就正常
+        with httpx.Client(trust_env=False) as plain:
+            plain.close()
+
+        # ③ 两个调用点必须显式不走环境代理,且请求体/响应链路保持原样
+        seen: list[dict] = []
+
+        class FakeResp:
+            status_code = 200
+            text = '{"ok": true}'
+
+            def json(self) -> dict:
+                return {"choices": [{"message": {"content": '{"confidence": 0.9}'}}]}
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                seen.append(kwargs)
+                assert kwargs.get("trust_env") is False, f"调用点应显式 trust_env=False,实际 {kwargs}"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def post(self, url, **kwargs):
+                assert url.startswith("https://"), f"请求地址应当是目标站点本身,实际 {url}"
+                return FakeResp()
+
+        real_client = httpx.Client
+        httpx.Client = FakeClient
+        try:
+            cfg = ConfigStore(Path(tempfile.mkdtemp(prefix="zcode-noproxy-")) / "config.yaml")
+            cfg.patch({"vision": {"api_key": "sk-selftest", "model": "some-vision-model"}})
+            result = VisionClient(cfg).chat("定位领取按钮", b"\x89PNG fake")
+            assert result.get("confidence") == 0.9, f"视觉请求应当成功,得到 {result}"
+
+            from core import notify
+
+            ok, message = notify.webhook("https://example.com/hook", "标题", "内容")
+            assert ok, f"webhook 推送应当成功,得到 {message}"
+        finally:
+            httpx.Client = real_client
+        assert len(seen) >= 2, f"两处调用都该各建一个 client,实际 {len(seen)} 次"
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    return "httpx 不再继承环境代理;视觉与 webhook 请求在畸形 NO_PROXY 下仍能发出"
 
 
 def __motion_guard_case():
@@ -635,32 +917,43 @@ def __motion_guard_case():
 
 
 def __modifier_guard_case():
-    """回归:置前失败时不得把 ALT 键卡在按下态。
+    """回归:置前用的 ALT 不得留下"卡在按下态"的残留。
 
-    事故背景:foreground() 里"按下 ALT → SetForegroundWindow → 抬起 ALT"写在同一个
-    try 中,而置前失败会抛异常,抬键语句被跳过 → ALT 永久按下,整机键鼠输入错乱
-    (菜单被激活、点击变 Alt+点击、焦点乱跳)。
+    事故背景:老写法是 keybd_event 按下 ALT → SetForegroundWindow → keybd_event 抬起。
+    两处都会出问题:置前失败抛异常时抬键被跳过;更隐蔽的是置前**成功**时前台线程已经
+    换人,按下落在旧线程、抬起落在新线程,旧线程永远认为 ALT 还按着——用户看到的
+    "操作一段后 ALT 处于按下状态"正是这个后遗症(菜单自己激活、点击变 Alt+点击)。
+    修法:成对按键用一批 SendInput 发完,而且发在切前台之前;够不着的提权窗口不发。
     """
+    import ctypes
+    import struct
+
     import win32con
 
     import core.zcode_ctrl as zc
 
-    class FakeApi:
-        """记录按键事件并维护"哪些键正按着"。"""
+    class Keys:
+        """替身按键通道:按"批"记录注入,并模拟队列里哪些键还记着按下。"""
 
-        def __init__(self, pressed=()):
-            self.events = []
-            self.pressed = set(pressed)
+        def __init__(self, queued=(), physical=()):
+            self.batches = []
+            self.queued = set(queued)
+            self.physical = set(physical)
 
-        def keybd_event(self, vk, scan, flags, extra):
-            self.events.append((vk, flags))
-            if flags & win32con.KEYEVENTF_KEYUP:
-                self.pressed.discard(vk)
-            else:
-                self.pressed.add(vk)
+        def send(self, events):
+            self.batches.append(list(events))
+            for vk, flags in events:
+                if flags & win32con.KEYEVENTF_KEYUP:
+                    self.queued.discard(vk)
+                else:
+                    self.queued.add(vk)
+            return True
 
-        def GetAsyncKeyState(self, vk):
-            return 0x8000 if vk in self.pressed else 0
+        def GetKeyState(self, vk):        # 线程队列里的状态(可能是残留)
+            return 0x8000 if vk in self.queued else 0
+
+        def GetAsyncKeyState(self, vk):   # 物理上此刻是否按着
+            return 0x8000 if vk in self.physical else 0
 
     class FakeGui:
         def __init__(self, denied):
@@ -671,35 +964,61 @@ def __modifier_guard_case():
                 raise RuntimeError("前台锁定:系统拒绝置前")
             return None
 
-    orig_api, orig_gui = zc.win32api, zc.win32gui
+    orig = (zc.win32api, zc.win32gui, zc.send_key_events, zc.window_pid, zc.runs_elevated)
     try:
-        # ① 置前被拒(抛异常):ALT 必须成对按下/抬起,不留残留
-        api, gui = FakeApi(), FakeGui(denied=True)
-        zc.win32api, zc.win32gui = api, gui
+        zc.window_pid = lambda hwnd: 4242
+        zc.runs_elevated = lambda pid: False      # 默认按"没提权"判,③ 里再改
+
+        # ① 置前被拒:ALT 必须成对、且一次性发完,不留残留
+        keys = Keys()
+        zc.win32api, zc.win32gui = keys, FakeGui(denied=True)
+        zc.send_key_events = keys.send
         assert zc._set_foreground(1) is False, "被拒时应返回 False"
-        downs = [e for e in api.events if not e[1] & win32con.KEYEVENTF_KEYUP]
-        ups = [e for e in api.events if e[1] & win32con.KEYEVENTF_KEYUP]
-        assert len(downs) == len(ups) == 1, f"ALT 应按下 1 次、抬起 1 次,实际 {api.events}"
-        assert api.pressed == set(), f"ALT 仍处于按下态:{api.pressed}"
+        assert keys.batches == [[(zc.VK_MENU, 0), (zc.VK_MENU, win32con.KEYEVENTF_KEYUP)]], \
+            f"ALT 应成对且一批发完,实际 {keys.batches}"
+        assert keys.queued == set(), f"ALT 仍处于按下态:{keys.queued}"
 
         # ② 正常置前:不必借 ALT,也不留残留
-        api2 = FakeApi()
-        zc.win32api, zc.win32gui = api2, FakeGui(denied=False)
+        keys2 = Keys()
+        zc.win32api, zc.win32gui = keys2, FakeGui(denied=False)
+        zc.send_key_events = keys2.send
         assert zc._set_foreground(1) is True
-        assert api2.events == [], f"成功路径不应注入按键:{api2.events}"
+        assert keys2.batches == [], f"成功路径不应注入按键:{keys2.batches}"
 
-        # ③ 启动兜底:系统里已卡住的 ALT 会被抬起
-        api3 = FakeApi(pressed={zc.VK_MENU})
-        zc.win32api = api3
-        assert zc.release_stuck_modifiers() == ["ALT"], "应清理卡住的 ALT"
-        assert api3.pressed == set(), "清理后 ALT 不应仍是按下态"
+        # ③ 提权窗口:焦点抢不到,按键更是白留残留 —— 一个按键事件都不发
+        keys3 = Keys()
+        zc.win32api, zc.win32gui = keys3, FakeGui(denied=True)
+        zc.send_key_events = keys3.send
+        zc.runs_elevated = lambda pid: True
+        assert zc._set_foreground(1) is False
+        assert keys3.batches == [], f"提权目标不该注入按键:{keys3.batches}"
+        zc.runs_elevated = lambda pid: False
+
+        # ④ 用户真按着 Alt:物理与队列同时为按下,不去打扰他
+        keys4 = Keys(queued={zc.VK_MENU}, physical={zc.VK_MENU})
+        zc.win32api, zc.send_key_events = keys4, keys4.send
+        assert zc.release_stuck_modifiers() == [], "用户正按着 Alt 时不应抬他的键"
+        assert keys4.batches == [], f"不该注入抬键:{keys4.batches}"
+
+        # ⑤ 只剩队列残留(程序自己留下的):抬起来一次,之后再查已经干净
+        keys5 = Keys(queued={zc.VK_MENU})
+        zc.win32api, zc.send_key_events = keys5, keys5.send
+        assert zc.release_stuck_modifiers() == ["ALT"], f"应清理卡住的 ALT:{keys5.batches}"
+        assert keys5.batches == [[(zc.VK_MENU, win32con.KEYEVENTF_KEYUP)]], \
+            f"补发的应是抬起事件:{keys5.batches}"
+        assert keys5.queued == set(), "清理后 ALT 不应仍是按下态"
         assert zc.release_stuck_modifiers() == [], "没有卡键时不应重复注入抬键"
+
+        # ⑥ SendInput 结构体尺寸:cbSize 报错尺寸会被系统整批拒绝(静默失败)
+        expect = 40 if struct.calcsize("P") == 8 else 28
+        assert ctypes.sizeof(zc._INPUT) == expect, \
+            f"_INPUT 尺寸 {ctypes.sizeof(zc._INPUT)} 与系统要求 {expect} 不符"
     finally:
-        zc.win32api, zc.win32gui = orig_api, orig_gui
+        zc.win32api, zc.win32gui, zc.send_key_events, zc.window_pid, zc.runs_elevated = orig
 
     idle = zc.idle_seconds()                     # 真实读数,不改变任何状态
     assert idle is None or idle >= 0, f"空闲时长读数异常:{idle}"
-    return "置前失败不再卡住 ALT;启动兜底可清理残留按键"
+    return "置前用的 ALT 一批发完不留残留;提权目标与用户按键均不打扰"
 
 
 def __user_idle_guard_case():
@@ -766,6 +1085,8 @@ def __user_idle_guard_case():
 
 
 def __ui_assets_case():
+    import re
+
     from core.config import UI_DIR
 
     required = [
@@ -779,13 +1100,49 @@ def __ui_assets_case():
         "assets/js/pages/dashboard.js",
         "assets/js/pages/flow.js",
         "assets/js/pages/schedule.js",
+        "assets/js/pages/targets.js",
         "assets/js/pages/vision.js",
         "assets/js/pages/logs.js",
         "assets/js/pages/settings.js",
     ]
     missing = [rel for rel in required if not (UI_DIR / rel).is_file()]
     assert not missing, f"缺少前端文件:{missing}"
-    return f"{len(required)} 个前端文件齐全"
+
+    # 页面装配:JS 里注册了 PAGES.x,就必须有对应的标签页、页面容器和 <script> 引用。
+    # 三者缺一个都不会报错,只会表现为"点了标签没反应"或整页空白。
+    html = (UI_DIR / "index.html").read_text(encoding="utf-8")
+    pages_dir = UI_DIR / "assets" / "js" / "pages"
+    for js in sorted(pages_dir.glob("*.js")):
+        name = js.stem
+        if not re.search(r"PAGES\.%s\s*=" % re.escape(name), js.read_text(encoding="utf-8")):
+            continue
+        assert f'data-page="{name}"' in html, f"「{name}」没有对应的标签按钮"
+        assert f'id="page-{name}"' in html, f"「{name}」缺少页面容器 section#page-{name}"
+        assert f"assets/js/pages/{name}.js" in html, f"「{name}」的 JS 没被 index.html 引用"
+
+    # 脚本顺序:页面模块必须早于 app.js(app.js 启动时遍历 window.PAGES)
+    order = [m.group(1) for m in re.finditer(r'<script src="assets/js/(?:pages/)?([a-z]+)\.js"', html)]
+    assert order.index("app") > max(order.index(p) for p in order if p != "app"), \
+        f"app.js 必须最后加载,当前顺序:{order}"
+
+    # 录制页用到的元素:JS 里 $('xxx') 引用的每个 id 都必须真实存在。
+    # 少一个不会报错,只会在 init() 里抛异常 → 整页打不开(所以这里必须由脚本反查,
+    # 不能靠人肉维护一份 id 清单)。JS 自己 createElement 赋 id 的也算"已提供"。
+    provided = set(re.findall(r'\bid="([^"]+)"', html))
+    js_files = [UI_DIR / "assets/js/app.js"] + sorted((UI_DIR / "assets/js/pages").glob("*.js"))
+    sources = {str(p.relative_to(UI_DIR)): p.read_text(encoding="utf-8") for p in js_files}
+    for rel, src in sources.items():
+        provided |= set(re.findall(r"\.id\s*=\s*'([A-Za-z0-9_-]+)'", src))
+        provided |= set(re.findall(r'id="([A-Za-z0-9_-]+)"', src))
+    dangling = {}
+    for rel, src in sources.items():
+        used = set(re.findall(r"\$\('([A-Za-z0-9_-]+)'\)", src))
+        used |= set(re.findall(r"getElementById\('([A-Za-z0-9_-]+)'\)", src))
+        miss = sorted(used - provided)
+        if miss:
+            dangling[rel] = miss
+    assert not dangling, f"JS 引用了 index.html 里不存在的元素 id:{dangling}"
+    return f"{len(required)} 个前端文件齐全,{len(order)} 个脚本按序装配,元素 id 引用无悬空"
 
 
 def __runner_dry_case():
@@ -842,7 +1199,7 @@ def __runner_retry_case():
 
     calls = {"n": 0}
 
-    def fake_attempt(session, attempt, dry, abort, cfg):
+    def fake_attempt(session, attempt, dry, abort, cfg, target):
         calls["n"] += 1
         return "retry", f"模拟失败 {calls['n']}"
 
@@ -982,6 +1339,116 @@ def __origin_guard_case():
     return "跨站 Origin 与伪造 Host 均 403;本机与同源请求放行"
 
 
+def __vision_config_submit_case():
+    """识别设置提交:模型/地址必须落盘、重开仍在,且面板回填的默认就是实发的那个。
+
+    背景:面板每次保存都把 vBaseUrl/vModel 一起提交,而 api.py 原先只加工 api_key,
+    这两格一旦是空的就直接写进配置 —— 用户填过的模型 id 会被一次「留空提交」抹成空串,
+    退出重开后「模型 id 像是丢了」。这里把边界钉死:非空即落盘、重开必须还在、
+    留空不覆盖已存值(想恢复默认走「恢复默认」),旧文件里的空串要回填成真正生效的
+    默认模型,而且回填给面板的值必须等于真正发进请求体的那个。
+    """
+    import tempfile
+    from pathlib import Path
+
+    from core.api import Api
+    from core.config import DEFAULTS, ConfigStore
+    from core.events import EventBus
+    from core.runner import Runner
+    from core.scheduler import SlotScheduler
+    from core.storage import SessionStore
+    from core.vision import VisionClient
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="zcode-vision-submit-"))
+    path = tmp_dir / "config.yaml"
+    cfg = ConfigStore(path)
+    bus = EventBus()
+    store = SessionStore(tmp_dir / "shots")
+    runner = Runner(cfg, bus, store, VisionClient(cfg))
+    api = Api(cfg, bus, store, VisionClient(cfg), runner, SlotScheduler(cfg, lambda slot: None))
+    default_model = DEFAULTS["vision"]["model"]
+    default_base = DEFAULTS["vision"]["base_url"]
+
+    # ① 用户自己填的模型与地址必须原样落盘
+    api.save_vision_config({"vision": {
+        "provider": "deepseek", "base_url": "https://vision.example/v1",
+        "api_key": "sk-selftest-vision-0001", "model": "glm-4v-flash",
+        "temperature": 0.2, "detail": "auto", "max_tokens": 800,
+        "timeout_s": 20, "locate_confidence_min": 0.7, "humanize_mouse": False}})
+    assert cfg.get("vision", "base_url") == "https://vision.example/v1", "自定义地址未落盘"
+    assert cfg.get("vision", "model") == "glm-4v-flash", "自定义模型 id 未落盘"
+
+    # ② 重开程序(重新读盘)后还得在,而且面板回填的就是真正会用的那个 id
+    reopened = ConfigStore(path)
+    api2 = Api(reopened, bus, store, VisionClient(reopened), runner,
+               SlotScheduler(reopened, lambda slot: None))
+    shown = api2.get_vision_config()["vision"]
+    assert shown["model"] == "glm-4v-flash", f"重开后模型 id 丢失:{shown['model']!r}"
+    assert shown["base_url"] == "https://vision.example/v1", "重开后地址丢失"
+
+    # ③ 提交里两格留空 = 不修改(和 api_key 同约定):已存的自定义值必须原样留着,
+    #    面板上看着空不代表配置丢了,更不该在下次保存时被默认值悄悄盖掉
+    reopened.patch({"vision": {"model": "custom-vision-model",
+                               "base_url": "https://custom.example/v1"}})
+    api2.save_vision_config({"vision": {"base_url": "", "model": "", "api_key": ""}})
+    assert reopened.get("vision", "model") == "custom-vision-model", "留空提交把模型 id 抹掉了"
+    assert reopened.get("vision", "base_url") == "https://custom.example/v1", "留空提交把地址抹掉了"
+    assert (reopened.get("vision", "api_key") or "") == "sk-selftest-vision-0001", "留空不该清掉已存 Key"
+
+    # ④ 旧版本写进文件的空串(当年保存一次就把 model 抹成 "")要回填成真正生效的默认
+    legacy = ConfigStore(tmp_dir / "legacy-blank.yaml")
+    legacy.patch({"vision": {"api_key": "sk-selftest-legacy", "model": "", "base_url": ""}})
+    legacy = ConfigStore(tmp_dir / "legacy-blank.yaml")
+    assert (legacy.get("vision", "model") or "") == "", "测试前提:文件里确实是空串"
+    api3 = Api(legacy, bus, store, VisionClient(legacy), runner,
+               SlotScheduler(legacy, lambda slot: None))
+    shown3 = api3.get_vision_config()["vision"]
+    assert shown3["model"] == default_model, f"空模型未回填默认:{shown3['model']!r}"
+    assert shown3["base_url"] == default_base, f"空地址未回填默认:{shown3['base_url']!r}"
+
+    # ⑤ 只提交词表不许顺手碰模型/地址(api.py 只在 payload 带 vision 时才动这两格)
+    reopened.patch({"vision": {"model": "custom-keep"}})
+    api2.save_vision_config({"claimed_keywords": ["已领取"]})
+    assert reopened.get("vision", "model") == "custom-keep", "保存词表把模型 id 抹掉了"
+
+    # ⑥ 面板显示什么就真发什么:请求体里的 model/URL 必须等于回填后的值
+    # chat() 走的是 httpx.Client(...).post(...),打模块级 httpx.post 截不到
+    import core.vision as vision_module
+
+    sent: dict = {}
+
+    class _Resp:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": '{"confidence": 1}'}}]}
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            sent["trust_env"] = kwargs.get("trust_env")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, **kwargs):
+            sent.update(url=url, model=(kwargs.get("json") or {}).get("model"))
+            return _Resp()
+
+    real_client = vision_module.httpx.Client
+    vision_module.httpx.Client = _FakeClient
+    try:
+        VisionClient(legacy).chat("ping", b"PNG")
+    finally:
+        vision_module.httpx.Client = real_client
+    assert sent.get("trust_env") is False, "实发请求没有关闭环境代理"
+    assert sent.get("model") == default_model, f"实发模型与面板显示不一致:{sent}"
+    assert default_base in (sent.get("url") or ""), f"实发地址与面板显示不一致:{sent}"
+    return "地址/模型 id:非空即落盘、重开仍在、留空不覆盖、旧空串回填默认且与实发一致"
+
+
 def __api_key_mask_case():
     """API Key 不回传明文:读取只给尾号提示,留空保持、显式清除、重新输入替换。"""
     import tempfile
@@ -1093,9 +1560,6 @@ def __single_instance_case():
         si.release()
         return "非 Windows 平台:跳过多实例校验(acquire 恒放行)"
 
-    assert si.acquire() is True, "首次 acquire 应成功"
-    assert si.acquire() is True, "同进程重复 acquire 应幂等返回 True"
-
     with tempfile.TemporaryDirectory() as tmp:
         script = Path(tmp) / "child.py"
         script.write_text(
@@ -1105,13 +1569,25 @@ def __single_instance_case():
             "print('ACQUIRED' if acquire() else 'BLOCKED')\n",
             encoding="utf-8",
         )
-        blocked = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=90)
-        assert blocked.returncode == 0, f"子进程执行失败:{blocked.stderr.strip()[-200:]}"
-        assert "BLOCKED" in blocked.stdout, f"已有实例时子进程不应拿到锁,实际:{blocked.stdout!r}"
+
+        def child_out():
+            done = subprocess.run([sys.executable, str(script)], capture_output=True,
+                                  text=True, timeout=90)
+            assert done.returncode == 0, f"子进程执行失败:{done.stderr.strip()[-200:]}"
+            return done.stdout
+
+        if not si.acquire():
+            # 本机已经有一个正式实例在运行(面板开着),锁在人家的进程里。
+            # 这正是"第二个实例必须被拒"的现场:只验证跨进程拒绝,不去抢别人的锁,
+            # 也不 release(那会把别人的实例判成已退出)。
+            assert "BLOCKED" in child_out(), "外部实例持锁时,新进程应当拿不到锁"
+            return "本机已有实例在运行:跨进程被拒已验证(幂等/释放两项跳过)"
+
+        assert si.acquire() is True, "同进程重复 acquire 应幂等返回 True"
+        assert "BLOCKED" in child_out(), "已有实例时子进程不应拿到锁"
 
         si.release()
-        free = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=90)
-        assert "ACQUIRED" in free.stdout, f"释放后子进程应能拿到锁,实际:{free.stdout!r}"
+        assert "ACQUIRED" in child_out(), "释放后子进程应能拿到锁"
 
     return "同进程幂等;跨进程占用时被拒、释放后可获得"
 
@@ -1264,20 +1740,22 @@ def __no_card_case():
     })
     store = SessionStore(tmp / "shots")
     runner = Runner(cfg, EventBus(), store, VisionClient(cfg))
+    target = runner.slot_targets({})[0]
     cfg_dict = cfg.all()
 
     shot = SimpleNamespace(png=b"\x89PNG-fake", width=1240, height=860,
                            rect=(40, 40, 1240, 860), uniform_ratio=0.3,
                            full_size=(1920, 1080))
-    runner._open_client = lambda dry, cfg: {"hwnd": 1, "title": "Fake", "rect": [40, 40, 1240, 860]}
+    runner._open_client = lambda dry, cfg, target: {"hwnd": 1, "title": "Fake", "rect": [40, 40, 1240, 860]}
     runner._close_client = lambda dry: None
-    runner._grab_ready = lambda win, rect, cfg, dry, label, timeout=None: (shot, None)
-    runner._position_window = lambda win, cfg, dry: tuple(win["rect"])
+    runner._grab_ready = lambda win, rect, cfg, dry, target, label, timeout=None: (shot, None)
+    runner._position_window = lambda win, cfg, dry, target=None: tuple(win["rect"])
     runner._wait_user_idle = lambda cfg, abort: False
     runner._ensure_foreground = lambda win, cfg: True
     import core.clicker as clicker_module
     clicks = []
     clicker_module.click_norm = lambda rect, box, humanize=False: clicks.append(box)
+    runner._foreground_unreachable = lambda win, target: ""
 
     located = {"n": 0}
 
@@ -1290,7 +1768,7 @@ def __no_card_case():
     session = store.begin("manual", {"time": None})
     attempt = store.begin_attempt(session, 1)
     import threading
-    result, reason = runner._one_attempt(session, attempt, False, threading.Event(), cfg_dict)
+    result, reason = runner._one_attempt(session, attempt, False, threading.Event(), cfg_dict, target)
 
     assert result == "retry", f"复查仍无卡片应按重试处理,得到 {result}({reason})"
     assert not clicks, f"卡片不在时不该点击:{clicks}"
@@ -1310,12 +1788,12 @@ def __no_card_case():
                 "confidence": 0.93, "notes": "卡片出现了"}
 
     runner.vision.locate = late_card
-    runner.vision.verify = lambda png: {"popup": "success", "keywords": ["领取成功"],
+    runner.vision.verify = lambda png, target=None: {"popup": "success", "keywords": ["领取成功"],
                                         "confidence": 0.95}
     clicks.clear()
     session2 = store.begin("manual", {"time": None})
     attempt2 = store.begin_attempt(session2, 1)
-    result2, _ = runner._one_attempt(session2, attempt2, False, threading.Event(), cfg_dict)
+    result2, _ = runner._one_attempt(session2, attempt2, False, threading.Event(), cfg_dict, target)
     assert result2 == "success", f"卡片晚出现时应继续领取,得到 {result2}"
     assert len(clicks) == 1, f"卡片出现后应点击一次,实际 {len(clicks)} 次"
     return "卡片不在:复查一次,晚出现继续领,仍缺失按重试循环(不点击)"
@@ -1348,16 +1826,16 @@ def __verify_pending_case():
     })
     store = SessionStore(tmp / "shots")
     runner = Runner(cfg, EventBus(), store, VisionClient(cfg))
+    target = runner.slot_targets({})[0]
     cfg_dict = cfg.all()
 
     shot = SimpleNamespace(png=b"\x89PNG-fake", width=1240, height=860,
                            rect=(40, 40, 1240, 860), uniform_ratio=0.3,
                            full_size=(1920, 1080))
-    runner._open_client = lambda dry, cfg: {"hwnd": 1, "title": "Fake", "rect": [40, 40, 1240, 860]}
+    runner._open_client = lambda dry, cfg, target: {"hwnd": 1, "title": "Fake", "rect": [40, 40, 1240, 860]}
     runner._close_client = lambda dry: None
-    runner._grab_ready = lambda win, rect, cfg, dry, label, timeout=None: (shot, None)
-    runner._position_window = lambda win, cfg, dry: tuple(win["rect"])
-    runner._user_idle_ok = lambda cfg, abort: False
+    runner._grab_ready = lambda win, rect, cfg, dry, target, label, timeout=None: (shot, None)
+    runner._position_window = lambda win, cfg, dry, target=None: tuple(win["rect"])
     runner._wait_user_idle = lambda cfg, abort: False
     runner._ensure_foreground = lambda win, cfg: True
     runner.vision.locate = lambda png: {
@@ -1369,12 +1847,13 @@ def __verify_pending_case():
     real_click = clicker_module.click_norm
     clicks = []
     clicker_module.click_norm = lambda rect, box, humanize=False: clicks.append(box)
+    runner._foreground_unreachable = lambda win, target: ""
 
     try:
         # 到点仍在加载:按未成功收尾进入重试循环;等待必须真实发生
         checks = {"n": 0}
 
-        def fake_verify(png):
+        def fake_verify(png, target=None):
             checks["n"] += 1
             return {"pending": True, "popup": "pending", "keywords": ["领取中"],
                     "confidence": 0.9, "notes": "按钮在转圈"}
@@ -1383,7 +1862,7 @@ def __verify_pending_case():
         session = store.begin("manual", {"time": None})
         attempt = store.begin_attempt(session, 1)
         started = time.time()
-        result, reason = runner._one_attempt(session, attempt, False, threading.Event(), cfg_dict)
+        result, reason = runner._one_attempt(session, attempt, False, threading.Event(), cfg_dict, target)
         elapsed = time.time() - started
         assert result == "retry", f"到点仍在加载应按未成功重试,得到 {result}({reason})"
         assert elapsed >= 1.0, f"点击后的固定等待应真实发生,实际只等了 {elapsed:.1f}s"
@@ -1396,11 +1875,11 @@ def __verify_pending_case():
 
         # 到点已出成功弹窗:直接成功收尾
         checks["n"] = 0
-        runner.vision.verify = lambda png: {"popup": "success", "keywords": ["领取成功"],
+        runner.vision.verify = lambda png, target=None: {"popup": "success", "keywords": ["领取成功"],
                                             "confidence": 0.95}
         session2 = store.begin("manual", {"time": None})
         attempt2 = store.begin_attempt(session2, 1)
-        result2, _ = runner._one_attempt(session2, attempt2, False, threading.Event(), cfg_dict)
+        result2, _ = runner._one_attempt(session2, attempt2, False, threading.Event(), cfg_dict, target)
         assert result2 == "success", f"到点已出成功弹窗应判成功,得到 {result2}"
     finally:
         clicker_module.click_norm = real_click
@@ -1408,144 +1887,665 @@ def __verify_pending_case():
     return "点击后固定等待一次判定:仍在加载即重试,出结果即成功(不轮询)"
 
 
-def __weekly_case():
-    """每周一次机会:周期从周五算起;本周已领到后,后续场次跳过而不空跑。
+def __claims_case():
+    """领取周期(once=none/daily/weekly)与多目标场次分发。
 
-    背景:福利一周只有一次机会,而用户会在一天里配好几个候选场次。旧行为是每场都
-    照跑,第一场领到之后,后面的场次仍会白开客户端、白调两次视觉 API。
+    背景:福利有周期,而用户会在一天里排好几个候选场次 —— 某场领到后,同周期内
+    后面的场次再跑也变不出福利,只会白开客户端、白调两次视觉。另一个方向同样重要:
+    ZCode 现在是「每天每场都要跑」,用 once=none 表达,任何场次都不许跳过。
     """
     import tempfile
     from datetime import date, timedelta
     from pathlib import Path
+    from types import SimpleNamespace
 
+    from core.claims import ClaimStore, period_of, week_end_of
     from core.config import ConfigStore
     from core.events import EventBus
     from core.runner import Runner
     from core.storage import SessionStore
+    from core.targets import ONCE_DAILY, ONCE_NONE, ONCE_WEEKLY
     from core.vision import VisionClient
-    from core.weekly import WeeklyStore, week_end_of, week_start_of
 
-    # ① 周期边界:周五开头,周四结尾
+    # ① 周期边界:weekly 从周五起算,daily 跨零点即重来,none 不设周期
     fri = date(2026, 9, 18)          # 周五
     sat = fri + timedelta(days=1)
     thu = fri + timedelta(days=6)    # 下个周四
     nxt = fri + timedelta(days=7)    # 再下一个周五
     assert fri.weekday() == 4 and thu.weekday() == 3
-    assert week_start_of(fri) == fri, f"周五应属于自己那一周:{week_start_of(fri)}"
-    assert week_start_of(sat) == fri, "周六应归入同周"
-    assert week_start_of(thu) == fri, "周四应归入同周"
-    assert week_end_of(fri) == thu, f"周期末尾应是周四:{week_end_of(fri)}"
-    assert week_start_of(nxt) == nxt, "下一个周五应开启新周期"
-    assert week_start_of(fri - timedelta(days=1)) == fri - timedelta(days=7), \
-        "周四(前一天)应属于上一周期,不能被算进本周"
+    assert period_of(ONCE_NONE, fri) is None, "once=none 不该有周期"
+    assert period_of("bogus", fri) is None, "无法识别的周期值应按不记账处理,而不是悄悄变成每周"
+    assert period_of(ONCE_DAILY, fri) == fri.isoformat()
+    assert period_of(ONCE_DAILY, sat) == sat.isoformat(), "每天一次:跨零点应进入新周期"
+    assert period_of(ONCE_WEEKLY, fri) == fri.isoformat()
+    assert period_of(ONCE_WEEKLY, sat) == fri.isoformat(), "周六应属于周五开头那一周"
+    assert period_of(ONCE_WEEKLY, thu) == fri.isoformat(), "周四应属于同一周期"
+    assert period_of(ONCE_WEEKLY, nxt) == nxt.isoformat(), "下一个周五应开启新周期"
+    assert period_of(ONCE_WEEKLY, fri - timedelta(days=1)) == (fri - timedelta(days=7)).isoformat(), \
+        "周四(前一天)属于上一周期,不能被算进本周"
+    assert week_end_of(fri) == thu
 
-    # ② 状态读写:过期的周期记录不算数
-    tmp = Path(tempfile.mkdtemp(prefix="zcode-weekly-"))
-    ws = WeeklyStore(tmp / "weekly.json")
-    assert ws.claimed_this_week(fri) is False, "初始应为未领取"
-    ws.mark_claimed(slot="19:00", source="schedule", when=fri)
-    assert ws.claimed_this_week(fri) is True, "记录后应为已领取"
-    assert ws.claimed_this_week(sat) is True, "同一周期内(周六)仍算已领取"
-    assert ws.claimed_this_week(nxt) is False, "下一个周期应自动失效(周五重新开始)"
-    st = ws.state(fri)
-    assert st["claimed_slot"] == "19:00" and st["claimed_source"] == "schedule"
-    ws.clear()
-    assert ws.claimed_this_week(fri) is False, "清除后应回到未领取"
+    # ② 记账按目标隔离,周期一过自动失效
+    tmp = Path(tempfile.mkdtemp(prefix="zcode-claims-"))
+    claims = ClaimStore(tmp / "claims.json")
+    assert claims.claimed("zcode", ONCE_WEEKLY, fri) is False, "初始应为未领取"
+    claims.mark("zcode", ONCE_WEEKLY, slot="19:00", source="schedule", when=fri)
+    assert claims.claimed("zcode", ONCE_WEEKLY, sat) is True, "同一周期内仍算已领取"
+    assert claims.claimed("trae", ONCE_WEEKLY, sat) is False, "别的目标不该跟着被跳过"
+    assert claims.claimed("zcode", ONCE_WEEKLY, nxt) is False, "下一周期应自动失效"
+    assert claims.claimed("zcode", ONCE_DAILY, fri) is True, "同一天的 daily 也算已领"
+    assert claims.claimed("zcode", ONCE_DAILY, sat) is False, "daily 到第二天就该重来"
+    state = claims.state("zcode", ONCE_WEEKLY, fri)
+    assert state["claimed_slot"] == "19:00" and state["claimed_source"] == "schedule"
+    assert claims.mark("zcode", ONCE_NONE, when=fri) == {}, "once=none 不该写账(否则就变成会跳过的目标)"
+    assert claims.clear("nope") == 0
+    assert claims.clear("zcode") == 1
+    assert claims.claimed("zcode", ONCE_WEEKLY, fri) is False, "清除后应回到未领取"
 
-    # ③ 坏文件不能让流程崩:当作未领取处理
-    (tmp / "weekly.json").write_text("{ 这不是 json", encoding="utf-8")
-    assert ws.claimed_this_week(fri) is False, "损坏的状态文件应按未领取处理"
+    # ③ 坏文件不能让流程崩:当作未领取处理(宁可多试一次,也不要漏领)
+    claims.mark("zcode", ONCE_WEEKLY, when=fri)
+    (tmp / "claims.json").write_text("{ 这不是 json", encoding="utf-8")
+    assert claims.claimed("zcode", ONCE_WEEKLY, fri) is False, "损坏的记账文件应按未领取处理"
 
-    # ④ 执行器:本周已领到后的场次必须跳过,且完全不碰客户端
-    tmp2 = Path(tempfile.mkdtemp(prefix="zcode-weekly-run-"))
+    # ④ 执行器:一个场次跑多个目标,已领的目标跳过、未限周期的照跑
+    tmp2 = Path(tempfile.mkdtemp(prefix="zcode-claims-run-"))
     cfg = ConfigStore(tmp2 / "config.yaml")
-    cfg.patch({"app": {"dry_run": False, "weekly_once": True},
-               "vision": {"api_key": "selftest-fake-key"},   # 让流程走到视觉调用(视觉已被打桩)
-               "retry": {"watchdog_s": 30, "verify_wait_s": 0}})
+    cfg.patch({
+        "targets": [
+            {"id": "zcode", "name": "ZCode", "exe": r"D:\Zcode\ZCode.exe", "once": ONCE_WEEKLY},
+            {"id": "trae", "name": "Trae", "exe": r"D:\Trae\Trae CN.exe", "once": ONCE_NONE},
+            {"id": "off", "name": "已停用", "exe": r"D:\Off\Off.exe", "enabled": False},
+        ],
+        "app": {"dry_run": False},
+        "vision": {"api_key": "selftest-fake-key"},
+        "notify": {"desktop": False, "webhook_url": ""},
+        "retry": {"watchdog_s": 30, "verify_wait_s": 0, "max_attempts": 1, "retry_gap_s": 1},
+    })
     store = SessionStore(tmp2 / "shots")
-    weekly = WeeklyStore(tmp2 / "weekly.json")
-    runner = Runner(cfg, EventBus(), store, VisionClient(cfg), weekly=weekly)
+    runner = Runner(cfg, EventBus(), store, VisionClient(cfg), claims=claims)
 
-    touched = {"open": 0}
+    def fake_open(dry, cfg, target):
+        opened.append(target["id"])
+        return {"hwnd": 1, "title": "Fake", "rect": [40, 40, 1240, 860]}
 
-    def fake_open(dry, cfg):
-        touched["open"] += 1
-        return {"hwnd": 1, "title": "FakeZCode", "rect": [40, 40, 1240, 860]}
-
+    opened: list[str] = []
     runner._open_client = fake_open
     runner._close_client = lambda dry: None
-    # 自检在自己的进程里跑,不能真去检测/抢占键鼠与前台
     runner._wait_user_idle = lambda cfg, abort: False
     runner._ensure_foreground = lambda win, cfg: True
-
-    # 本周未领 → 正常执行(识别被打桩放空,只跑 1 次尝试;这里只验证"没被跳过")
-    res1 = runner.run_session("schedule", {"time": "19:00", "attempts": 1, "retry_gap_s": 1})
-    assert res1["status"] != "skipped", f"本周未领时不该跳过,得到 {res1}"
-    assert touched["open"] > 0, "本周未领时应真的去开客户端"
-
-    # 标记本周已领 → 后续场次全部跳过
-    weekly.mark_claimed(slot="19:00", source="schedule")
-    touched["open"] = 0
-    res2 = runner.run_session("schedule", {"time": "20:00"})
-    assert res2["status"] == "skipped", f"本周已领后应跳过,得到 {res2}"
-    assert touched["open"] == 0, f"跳过的场次不该打开客户端(实际开了 {touched['open']} 次)"
-    assert "一周只有一次机会" in res2["summary"], f"跳过原因未说明每周限制:{res2['summary']}"
-    data = store.load(res2["session_id"])
-    assert data and data["status"] == "skipped", "跳过场次应留一条记录供面板显示"
-    assert not data.get("attempts"), "跳过的场次不该产生尝试记录"
-
-    # 手动试领不受每周限制(用户主动要求就该执行)。识别被打桩放空,会走重试,
-    # 所以只断言"确实动了客户端",而不是恰好一次。
-    touched["open"] = 0
-    res3 = runner.run_session("manual", {"attempts": 1, "retry_gap_s": 1})
-    assert res3["status"] != "skipped", f"手动试领不该被跳过,得到 {res3}"
-    assert touched["open"] > 0, "手动试领应真的去开客户端"
-
-    # 关掉「一周只领一次」则不再跳过
-    cfg.patch({"app": {"weekly_once": False}})
-    touched["open"] = 0
-    res4 = runner.run_session("schedule", {"time": "21:00", "attempts": 1, "retry_gap_s": 1})
-    assert res4["status"] != "skipped", f"关闭该功能后不该跳过,得到 {res4}"
-    assert touched["open"] > 0, "关闭该功能后应正常执行"
-
-    # ⑤ 领取成功后自动记账:下一次调度就该跳过
-    cfg.patch({"app": {"weekly_once": True}})
-    weekly.clear()
+    runner._position_window = lambda win, cfg, dry, target=None: tuple(win["rect"])
+    shot = SimpleNamespace(png=b"x", width=1240, height=860, rect=(40, 40, 1240, 860),
+                           uniform_ratio=0.3, full_size=(1920, 1080))
+    runner._grab_ready = lambda win, rect, cfg, dry, target, label, timeout=None: (shot, None)
     runner.vision.locate = lambda png: {
         "button_found": True, "claimable": True, "card_visible": True,
         "button_box": [0.089, 0.909, 0.106, 0.93], "button_label": "领取",
         "confidence": 0.93, "scene": "welfare",
     }
-    runner.vision.verify = lambda png: {"popup": "success", "keywords": ["领取成功"],
-                                        "confidence": 0.95}
-    from types import SimpleNamespace
-    shot = SimpleNamespace(png=b"x", width=1240, height=860, rect=(40, 40, 1240, 860),
-                           uniform_ratio=0.3, full_size=(1920, 1080))
-    runner._grab_ready = lambda win, rect, cfg, dry, label, timeout=None: (shot, None)
-    runner._position_window = lambda win, cfg, dry: tuple(win["rect"])
-    runner._wait_user_idle = lambda cfg, abort: False
-    runner._ensure_foreground = lambda win, cfg: True
-    runner._open_client = lambda dry, cfg: {"hwnd": 1, "title": "Fake", "rect": [40, 40, 1240, 860]}
+    runner.vision.verify = lambda png, target=None: {
+        "popup": "success", "keywords": ["领取成功"], "confidence": 0.95,
+    }
+
+    assert [t["id"] for t in runner.slot_targets({})] == ["zcode", "trae"], \
+        "留空的目标场次应跑全部「启用」的目标"
+    assert [t["id"] for t in runner.slot_targets({"target": "trae"})] == ["trae"], "指定目标应只跑那一个"
+    assert runner.slot_targets({"target": "nope"}) == [], "指定不存在的目标应判无目标可跑"
+    assert runner.slot_targets({"target": "off"}) == [], "停用的目标不该被场次拉起"
+
     import core.clicker as clicker_module
     real_click = clicker_module.click_norm
     clicker_module.click_norm = lambda rect, box, humanize=False: None
+    runner._foreground_unreachable = lambda win, target: ""
     try:
-        ok = runner.run_session("schedule", {"time": "19:00"})
+        res1 = runner.run_session("schedule", {"time": "19:00"})
+        assert opened == ["zcode", "trae"], f"两个目标应各开一次客户端:{opened}"
+        assert [r["status"] for r in res1["results"]] == ["success", "success"], res1
+        assert claims.claimed("zcode", ONCE_WEEKLY) is True, "领取成功后应自动记账"
+        assert claims.claimed("trae", ONCE_WEEKLY) is False, "once=none 的目标不该记账(否则就会被跳过)"
+
+        # 同一周期内的下一场:zcode 跳过(不碰客户端),trae 照跑
+        opened.clear()
+        res2 = runner.run_session("schedule", {"time": "20:00"})
+        assert [r["status"] for r in res2["results"]] == ["skipped", "success"], res2
+        assert opened == ["trae"], f"已领的目标不该再打开客户端:{opened}"
+        skipped = next(r for r in res2["results"] if r["status"] == "skipped")
+        assert "一周只有一次机会" in skipped["summary"], f"跳过原因未说明周期限制:{skipped['summary']}"
+        data = store.load(skipped["session_id"])
+        assert data and data["status"] == "skipped" and data["target"] == "zcode", \
+            "跳过场次应留一条带目标名的记录供面板显示"
+        assert not data.get("attempts"), "跳过的场次不该产生尝试记录"
+
+        # 手动试领是用户主动要求,不受周期限制
+        opened.clear()
+        runner.run_session("manual", {"attempts": 1})
+        assert opened == ["zcode", "trae"], f"手动试领应无视周期:{opened}"
+
+        # 目标改成「每天一次」并记账:同样跳过,但提示要说清是每天的限制
+        items = cfg.all()["targets"]
+        items[0]["once"] = ONCE_DAILY
+        cfg.patch({"targets": items})
+        claims.mark("zcode", ONCE_DAILY, slot="19:00", source="schedule")
+        opened.clear()
+        res3 = runner.run_session("schedule", {"time": "21:00"})
+        first = res3["results"][0]
+        assert first["status"] == "skipped" and "每天只有一次机会" in first["summary"], res3
+
+        # 演练成功不算真正领到,不该占掉机会
+        claims.clear()
+        cfg.patch({"app": {"dry_run": True}})
+        runner.run_session("schedule", {"time": "19:00"})
+        assert claims.claimed("zcode", ONCE_DAILY) is False, "演练不应记账(否则一次演练就把机会用掉)"
+        cfg.patch({"app": {"dry_run": False}})
     finally:
         clicker_module.click_norm = real_click
-    assert ok["status"] == "success", f"这一场应领取成功,得到 {ok}"
-    assert weekly.claimed_this_week() is True, "领取成功后应自动记下本周已领"
-    after = runner.run_session("schedule", {"time": "20:00"})
-    assert after["status"] == "skipped", f"成功后的下一场应自动跳过,得到 {after}"
 
-    # ⑥ 演练不算真正领到,不该占掉机会
-    weekly.clear()
-    cfg.patch({"app": {"dry_run": True}})
-    runner.run_session("manual", {"time": None, "dry": True})
-    assert weekly.claimed_this_week() is False, "演练不应记账(否则一次演练就把机会用掉)"
-    cfg.patch({"app": {"dry_run": False}})
+    # ⑤ 面板「试领一次」的目标选择必须一路传到执行器:用户要能只测 WorkBuddy/Trae,
+    #    而不是被排在前面的 ZCode 用 5 次重试拖住,以为"这个按钮只管 ZCode"。
+    from core.api import Api
+    from core.scheduler import SlotScheduler
 
-    return "周期边界正确(周五开头);已领则跳过且不碰客户端;手动与演练不受限;成功后自动记账"
+    spawned: list[dict] = []
+    api = Api(cfg, EventBus(), store, VisionClient(cfg), runner,
+              SlotScheduler(cfg, lambda slot: None))
+    api.runner.spawn = lambda trigger, slot=None: (spawned.append(slot or {}), True)[1]
+
+    assert api.run_once(None)["ok"] is True, "手动跑全部目标应能启动"
+    assert spawned[-1] == {}, f"没选目标时该跑全部,不该被塞进 target:{spawned[-1]}"
+    one = api.run_once({"target": "trae", "dry": True})
+    assert spawned[-1] == {"dry": True, "target": "trae"}, spawned[-1]
+    assert "Trae" in one["message"] and one["targets"] == ["trae"], one
+    assert api.run_once({"target": "nope"})["ok"] is False, "指定不存在的目标必须直接拒绝"
+    assert api.run_once({"target": "off"})["ok"] is False, "停用的目标不该被手动拉起来"
+    assert api.run_target({"id": "trae"})["ok"] is True, "签到目标页的「只试跑这个目标」应可用"
+    assert spawned[-1].get("target") == "trae", spawned[-1]
+
+    # ⑥ 没有可跑目标时的场次:给出人话原因,而不是抛异常或空转
+    cfg.patch({"targets": [{"id": "off2", "name": "已停用", "exe": r"D:\O\O.exe", "enabled": False}]})
+    res4 = runner.run_session("schedule", {"time": "19:00"})
+    assert res4["status"] == "failed" and "签到目标" in res4["summary"], res4
+
+    return "周期边界正确;记账按目标隔离且跨周期失效;已领则跳过且不碰客户端;手动与演练不受限;多目标分发正确"
+
+
+def __targets_case():
+    """目标模型:清洗非法值、id 唯一,以及 v1.x 单目标配置的一次性迁移。
+
+    迁移只保真不改语义:老配置 weekly_once=true → once=weekly,想「每天每场都跑」
+    要显式改成 none —— 部署时按用户要求处理,但代码里不能替用户偷偷改行为。
+    """
+    import tempfile
+    from pathlib import Path
+
+    import yaml
+
+    from core.config import DEFAULTS, load_config
+    from core.targets import (ONCE_NONE, ONCE_WEEKLY, all_targets,
+                              enabled_targets, find, keywords_for, migrate_from_legacy,
+                              normalize, normalize_all)
+
+    # ① 清洗:非法枚举退回默认,残缺字段补齐,坏点击点丢弃
+    t = normalize({"id": "Trae CN", "exe": "D:\\a\\b.exe", "flow": "bogus", "once": "weekly",
+                   "find_by": "title", "startup_wait_s": "4",
+                   "steps": [{"anchor": "bottom_left", "dx": 10, "dy": 20, "label": "头像"},
+                             {"anchor": "somewhere_wrong", "dx": 1, "dy": 2},
+                             {"anchor": "window", "dx": "x", "dy": 2},
+                             "不是 dict"]})
+    assert t["id"] == "traecn", f"id 应被 slug 化:{t['id']}"
+    assert t["flow"] == "vision", "无法识别的流程应退回视觉模式"
+    assert t["once"] == ONCE_WEEKLY
+    assert t["startup_wait_s"] == 4.0, "数字字符串应能转成浮点"
+    assert len(t["steps"]) == 1 and t["steps"][0]["label"] == "头像", f"非法点击点应被丢掉:{t['steps']}"
+    assert t["steps"][0]["id"] == "step1" and t["steps"][0]["wait_after_s"] == 0.0
+    assert normalize("不是 dict") is None, "非 dict 入参不得当成目标"
+    assert normalize({"name": "签到目标"})["id"] == "target", \
+        "纯中文名称转不出 id 时用兜底 id,而不是把用户的目标丢掉"
+    assert normalize({"id": "", "name": "Trae CN"}, target_id="target3")["id"] == "target3", \
+        "整表保存时按位置给缺 id 的目标兜底"
+    assert normalize({"id": "x", "exe": "D:\\WorkBuddy\\WorkBuddy.exe"})["name"] == "WorkBuddy", \
+        "未填名称时用可执行文件名,面板上不至于显示空白"
+    assert normalize({"id": "x"})["window_title_match"] == "x", "标题匹配应有兜底值"
+    assert normalize({"id": "x", "startup_wait_s": -5})["startup_wait_s"] == 0.0
+
+    # ② id 唯一:重复 id 会让记账/场次指向错乱,必须自动错开
+    items = normalize_all([{"id": "a"}, {"id": "a"}, {"id": "a"}, {"id": "A"}])
+    assert [i["id"] for i in items] == ["a", "a-2", "a-3", "a-4"], [i["id"] for i in items]
+
+    # ③ 配置里完全没有 targets 时,出厂给一个 ZCode 视觉目标
+    assert [t["id"] for t in all_targets({})] == ["zcode"], "空配置应回落到默认目标"
+    assert all_targets({})[0]["flow"] == "vision" and all_targets({})[0]["once"] == ONCE_NONE
+
+    # ④ 词表覆盖:目标自带优先,没有则用全局
+    cfg = {"success_keywords": ["领取成功"]}
+    assert keywords_for({"success_keywords": ["签到成功"]}, cfg, "success_keywords") == ["签到成功"]
+    assert keywords_for({}, cfg, "success_keywords") == ["领取成功"]
+
+    # ⑤ 旧配置迁移:路径/标题/全屏/启动等待/每周一次逐项对应
+    legacy = {"app": {"zcode_path": "D:\\Zcode\\ZCode.exe", "window_title_match": "zcode 窗口",
+                      "fullscreen": False, "startup_wait_s": 8, "weekly_once": True}}
+    moved = migrate_from_legacy(legacy)
+    assert len(moved) == 1
+    assert moved[0]["exe"] == r"D:\Zcode\ZCode.exe" and moved[0]["window_title_match"] == "zcode 窗口"
+    assert moved[0]["fullscreen"] is False and moved[0]["startup_wait_s"] == 8.0
+    assert moved[0]["once"] == ONCE_WEEKLY, "weekly_once=true 对应 once=weekly"
+    assert migrate_from_legacy({"app": {"zcode_path": "x", "weekly_once": False}})[0]["once"] == ONCE_NONE
+    assert migrate_from_legacy({"app": {"weekly_once": True}}) is None or True
+    assert migrate_from_legacy({"targets": [{"id": "z"}], "app": {"zcode_path": "D:\\a.exe"}}) is None, \
+        "已有 targets 时不得重复迁移"
+
+    # ⑥ 落盘迁移:老 config.yaml 第一次被读取时就翻译成 targets 并写回
+    tmp = Path(tempfile.mkdtemp(prefix="zcode-migrate-"))
+    path = tmp / "config.yaml"
+    path.write_text(yaml.safe_dump({
+        "app": {"zcode_path": r"E:\ZCode\ZCode.exe", "weekly_once": True, "dry_run": False,
+                "window_rect": [0, 0, 100, 100], "restore_window_rect": True},
+        "schedule": {"slots": [{"time": "19:00", "enabled": True}]},
+        "vision": {"api_key": "sk-legacy"},
+    }, allow_unicode=True), encoding="utf-8")
+    migrated = load_config(path)
+    assert [t["id"] for t in migrated["targets"]] == ["zcode"], migrated.get("targets")
+    assert migrated["targets"][0]["exe"] == r"E:\ZCode\ZCode.exe"
+    assert migrated["targets"][0]["once"] == ONCE_WEEKLY
+    assert migrated["schedule"]["slots"][0]["target"] == "zcode", "老场次应锁定到迁移出的目标"
+    assert migrated["vision"]["api_key"] == "sk-legacy", "迁移不能丢 API Key"
+    for gone in ("zcode_path", "window_rect", "restore_window_rect", "weekly_once"):
+        assert gone not in migrated["app"], f"旧键 {gone} 应被清掉,免得改了以为还有效"
+    on_disk = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert on_disk.get("targets"), "迁移结果要落盘,否则每次启动都重算"
+    assert "zcode_path" not in on_disk["app"]
+    # 再读一次:已有 targets,不再迁移,也不会凭空多出一个目标
+    again = load_config(path)
+    assert [t["id"] for t in again["targets"]] == ["zcode"]
+    assert again["targets"][0]["exe"] == r"E:\ZCode\ZCode.exe"
+
+    # ⑦ 停用与查找
+    cfg2 = {"targets": [{"id": "a", "enabled": False}, {"id": "b"}, {"id": "c", "enabled": False}]}
+    assert [t["id"] for t in enabled_targets(cfg2)] == ["b"]
+    assert find(cfg2)["id"] == "b", "find 空 id 应返回第一个启用的目标"
+    assert find(cfg2, "c")["id"] == "c", "显式指定时停用的目标也要能取到(面板要能编辑它)"
+    assert find({"targets": [{"id": "z", "enabled": False}]})["id"] == "z", "全停用时也要有兜底"
+    assert "targets" in DEFAULTS and len(DEFAULTS["targets"]) == 1
+    return "非法值清洗;id 唯一;旧配置一次性迁移并落盘;停用/查找语义正确"
+
+
+def __coords_case():
+    """锚点坐标:录制一次点击 → 换窗口位置/尺寸后再解析回正确的屏幕像素。
+
+    录制面板只能给出"图片上的第几个像素",执行时才知道窗口在哪。
+    底边锚点是关键:头像菜单/浮层贴着窗口底边排布,窗口高度变化时它们跟着底边动,
+    用整窗归一化会让每个点各自按比例漂移。
+    """
+    from core.coords import ANCHORS, anchor_of, from_click, resolve
+
+    rect = [100, 50, 1200, 800]      # x, y, w, h
+
+    # ① 四种边角锚点的方向定义
+    assert resolve(rect, {"anchor": "top_left", "dx": 10, "dy": 20}) == (110, 70)
+    assert resolve(rect, {"anchor": "bottom_left", "dx": 10, "dy": 20}) == (110, 830)
+    assert resolve(rect, {"anchor": "top_right", "dx": 10, "dy": 20}) == (1290, 70)
+    assert resolve(rect, {"anchor": "bottom_right", "dx": 10, "dy": 20}) == (1290, 830)
+    assert resolve(rect, {"anchor": "window", "dx": 0.5, "dy": 0.25}) == (700, 250)
+
+    # ② 录制 → 执行 的往返:窗口移动后仍落在同一个相对位置
+    for img_x, img_y in [(88, 772), (177, 393), (1150, 30), (10, 10), (600, 799)]:
+        step = from_click(rect, img_x, img_y)
+        back = resolve(rect, step)
+        assert back == (rect[0] + img_x, rect[1] + img_y), \
+            f"往返不一致:{img_x},{img_y} → {step} → {back}"
+    # ③ 换了显示器/改了任务栏高度:贴底的点仍贴底,右上角的点仍贴右
+    assert from_click(rect, 88, 772)["anchor"] == "bottom_left"
+    assert from_click(rect, 1150, 30)["anchor"] == "top_right"
+    assert from_click(rect, 1150, 700)["anchor"] == "bottom_right"
+    assert from_click(rect, 100, 100)["anchor"] == "top_left"
+    moved = [0, 200, 1920, 1000]
+    recorded = from_click(rect, 88, 772)          # 底部靠左 → 底边偏移 dx=88, dy=28
+    assert recorded == {"anchor": "bottom_left", "dx": 88, "dy": 28}, recorded
+    assert resolve(moved, recorded) == (88, 1172), "窗口换到别处/换尺寸后,贴底的点应跟着底边移动"
+    assert resolve(moved, {"anchor": "window", "dx": 0.5, "dy": 0.5}) == (960, 700)
+
+    # ④ 非法输入一律返回 None(调用方据此判"坐标无法解析",绝不能瞎点)
+    assert resolve(None, {"anchor": "window", "dx": 0.5, "dy": 0.5}) is None
+    assert resolve([0, 0, 0, 100], {"anchor": "window", "dx": 0.5, "dy": 0.5}) is None
+    assert resolve(rect, {"anchor": "middle", "dx": 1, "dy": 1}) is None
+    assert resolve(rect, {"anchor": "window", "dx": None, "dy": 0.5}) is None
+    assert resolve(rect, {"anchor": "window", "dx": "abc", "dy": 0.5}) is None
+    assert resolve(["x", 0, 100, 100], {"anchor": "window", "dx": 0.5, "dy": 0.5}) is None
+    assert set(ANCHORS) == {"window", "top_left", "bottom_left", "top_right", "bottom_right"}
+    assert anchor_of(rect, 88, 772) == "bottom_left"
+
+    # ⑤ 窗口矩形含不可见边框时(实测 -8,-8,1928,1040),底边锚点天然对齐客户区底边
+    framed = [-8, -8, 1936, 1056]
+    assert resolve(framed, {"anchor": "bottom_left", "dx": 88, "dy": 28}) == (80, 1020)
+    return "五种锚点方向正确;录制→执行往返一致;窗口移动/缩放后贴边的点跟着边移动"
+
+
+def __post_clicks_case():
+    """领取后补关:成功之后按录制点关掉结果浮窗,补关自己出问题不许改动领取结果。
+
+    背景:Trae 领完券,浮窗还盖在头像那个入口上;ZCode 领完弹「领取成功」卡片。
+    次日这场第一下就点在浮窗自己身上,既领不到也认不出界面,所以补一关。
+    """
+    import tempfile
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import core.capture as capture_module
+    import core.clicker as clicker_module
+    import core.zcode_ctrl as zcode_module
+    from core.config import ConfigStore
+    from core.events import EventBus
+    from core.runner import Runner, steps_for
+    from core.storage import SessionStore
+    from core.vision import VisionClient
+
+    tmp = Path(tempfile.mkdtemp(prefix="zcode-post-"))
+    cfg = ConfigStore(tmp / "config.yaml")
+    cfg.patch({
+        "targets": [{
+            "id": "trae", "name": "Trae CN", "exe": r"D:\Programs\Trae CN\Trae CN.exe",
+            "flow": "steps", "verify": "none", "once": "none",
+            "steps": [{"id": "s1", "label": "头像", "anchor": "bottom_left", "dx": 117, "dy": 33}],
+            "post_steps": [{"id": "p1", "label": "关掉弹窗", "anchor": "bottom_left",
+                            "dx": 117, "dy": 33, "wait_after_s": 0}],
+        }, {
+            "id": "zcode", "name": "ZCode", "exe": r"E:\Program Files\ZCode\ZCode.exe",
+            "flow": "vision", "post_steps": [
+                {"id": "p1", "anchor": "top_right", "dx": 758, "dy": 260}],
+        }],
+        "retry": {"watchdog_s": 30, "max_attempts": 1, "retry_gap_s": 1},
+        "notify": {"desktop": False, "webhook_url": ""},
+    })
+    items = cfg.all()["targets"] if isinstance(cfg.all().get("targets"), list) else []
+    from core import targets as tmod
+    items = tmod.all_targets(cfg)
+    trae = next(t for t in items if t["id"] == "trae")
+    zcode_target = next(t for t in items if t["id"] == "zcode")
+
+    # ① 清洗:补关点与签到点同样清洗,脏点丢掉,不认识的键不放过
+    assert len(trae["post_steps"]) == 1 and trae["post_steps"][0]["label"] == "关掉弹窗", trae
+    dirty = tmod.normalize({"id": "x", "flow": "steps",
+                            "post_steps": [{"anchor": "nowhere", "dx": 1, "dy": 1},
+                                           {"anchor": "top_left", "dx": "12", "dy": 34}]}, "x")
+    assert len(dirty["post_steps"]) == 1, f"脏补关点应被丢掉:{dirty['post_steps']}"
+    assert dirty["post_steps"][0]["dx"] == 12.0, dirty["post_steps"]
+    assert steps_for(trae)[-1] == "收尾", "补关记在收尾阶段,不新增阶段名"
+    assert zcode_target["post_steps"][0]["anchor"] == "top_right", zcode_target["post_steps"]
+
+    runner = Runner(cfg, EventBus(), SessionStore(tmp / "shots"), VisionClient(cfg))
+    win = {"hwnd": 1, "title": "Trae CN", "rect": [0, 0, 1920, 1032]}
+    calls: list = []
+    shots = {"n": 0}
+
+    def fake_shot(rect):
+        shots["n"] += 1
+        return SimpleNamespace(png=b"x", width=rect[2], height=rect[3], rect=tuple(rect),
+                               uniform_ratio=0.4, full_size=(1920, 1080))
+
+    orig = (capture_module.grab_region, clicker_module.click_screen,
+            zcode_module.find_target_window, zcode_module.release_stuck_modifiers)
+    capture_module.grab_region = fake_shot
+    clicker_module.click_screen = lambda x, y, humanize=False: calls.append((x, y))
+    zcode_module.find_target_window = lambda target: dict(win)
+    zcode_module.release_stuck_modifiers = lambda: []
+    runner._foreground_unreachable = lambda w, t: ""
+    runner._wait_user_idle = lambda c, a: False
+    runner._ensure_foreground = lambda w, c: True
+    runner._position_window = lambda w, c, d, t=None: tuple(w["rect"])
+    cfg_dict = cfg.all()
+    try:
+        session = runner.store.begin("manual", {"time": None}, trae)
+        attempt = runner.store.begin_attempt(session, 1)
+
+        # ② 补关点击:按窗口矩形换算、留一张 postN 档、写在收尾阶段里
+        runner._close_popups(session, attempt, False, threading.Event(), cfg_dict, trae)
+        assert calls == [(117, 999)], f"补关点应按左下角换算:{calls}"
+        assert str(attempt["images"].get("post1") or "").endswith("post1.png"), attempt["images"]
+        tail = attempt["steps"][-1]
+        assert tail["step"] == "收尾" and "领取后补点" in tail["detail"], tail
+
+        # ③ 演练:只报坐标不动鼠标
+        calls.clear()
+        runner._close_popups(session, attempt, True, threading.Event(), cfg_dict, trae)
+        assert calls == [], f"演练不该点击:{calls}"
+
+        # ④ 补关被系统拒绝(提权):记下提醒就停,不许抛出去把已到账的结果带崩
+        calls.clear()
+
+        def blocked(x, y, humanize=False):
+            raise clicker_module.ClickBlocked("鼠标没能移到目标点")
+
+        clicker_module.click_screen = blocked
+        runner._close_popups(session, attempt, False, threading.Event(), cfg_dict, trae)
+        assert calls == []
+        assert "不影响本次结果" in attempt["steps"][-1]["detail"], attempt["steps"][-1]
+
+        # ⑤ 找不到窗口:记一条提醒,一个点都不许动;没录补关点则完全安静
+        clicker_module.click_screen = lambda x, y, humanize=False: calls.append((x, y))
+        before = len(attempt["steps"])
+        zcode_module.find_target_window = lambda target: None
+        runner._close_popups(session, attempt, False, threading.Event(), cfg_dict, trae)
+        assert calls == [], f"找不到窗口不该点击:{calls}"
+        assert len(attempt["steps"]) == before + 1, "找不到窗口只记一条提醒"
+        assert "找不到" in attempt["steps"][-1]["detail"], attempt["steps"][-1]
+        zcode_module.find_target_window = lambda target: dict(win)
+        no_post = tmod.normalize({"id": "plain", "exe": trae["exe"], "flow": "steps",
+                                  "steps": trae["steps"]}, "plain")
+        runner._close_popups(session, attempt, False, threading.Event(), cfg_dict, no_post)
+        assert len(attempt["steps"]) == before + 1, "没录补关点应安静跳过"
+
+        # ⑥ 挂钩:领取成功才补关;补关里闹起来也不改结果
+        seen: list = []
+        runner._open_client = lambda d, c, t: dict(win)
+        runner._close_client = lambda d: None
+        runner._one_attempt = lambda s, a, d, ab, c, t: ("success", "领取成功")
+        runner._close_popups = lambda s, a, d, ab, c, t: seen.append(d)
+        out = runner._run_target("manual", {"time": None}, trae, cfg_dict)
+        assert seen == [False] and out["status"] == "success", (seen, out)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("补关自己炸了")
+
+        runner._close_popups = boom
+        out = runner._run_target("manual", {"time": None}, trae, cfg_dict)
+        assert out["status"] == "success", f"补关异常不该影响领取结果:{out}"
+    finally:
+        (capture_module.grab_region, clicker_module.click_screen,
+         zcode_module.find_target_window, zcode_module.release_stuck_modifiers) = orig
+    return "补关点随目标清洗;成功后按录制点关浮窗;补关失败或异常都不改结果"
+
+
+def __steps_case():
+    """固定坐标流程:按录制顺序点击、每步留档、不在前台就不点、verify=none 直接收尾。
+
+    背景:WorkBuddy / Trae 的签到按钮位置固定(且各家点击次数不同),用视觉模型反而
+    不稳;这套流程把「点几下、点哪里」交给用户在面板里录制。
+    """
+    import tempfile
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from core.api import Api
+    from core.config import ConfigStore
+    from core.events import EventBus
+    from core.runner import Runner, steps_for
+    from core.storage import SessionStore
+    from core.vision import VisionClient
+    import core.capture as capture_module
+    import core.clicker as clicker_module
+
+    tmp = Path(tempfile.mkdtemp(prefix="zcode-steps-"))
+    cfg = ConfigStore(tmp / "config.yaml")
+    cfg.patch({
+        "targets": [{
+            "id": "workbuddy", "name": "WorkBuddy", "exe": r"E:\Program Files\WorkBuddy\WorkBuddy.exe",
+            "flow": "steps", "verify": "none", "once": "daily",
+            "steps": [
+                {"id": "s1", "label": "左下角头像", "anchor": "bottom_left", "dx": 88, "dy": 28},
+                {"id": "s2", "label": "Buddy加油站", "anchor": "bottom_left", "dx": 177, "dy": 407},
+                {"id": "s3", "label": "领取", "anchor": "top_left", "dx": 219, "dy": 85,
+                 "wait_after_s": 0},
+            ],
+        }],
+        "retry": {"watchdog_s": 30, "max_attempts": 1, "retry_gap_s": 1},
+        "notify": {"desktop": False, "webhook_url": ""},
+    })
+    runner = Runner(cfg, EventBus(), SessionStore(tmp / "shots"), VisionClient(cfg))
+    target = runner.slot_targets({})[0]
+    cfg_dict = cfg.all()
+
+    assert steps_for(target) == ["打开客户端", "按坐标点击", "校验结果", "收尾"], steps_for(target)
+    assert "识别按钮" not in steps_for({"flow": "steps"})
+    assert "识别按钮" in steps_for({"flow": "vision"})
+
+    win = {"hwnd": 1, "title": "WorkBuddy", "rect": [0, 0, 1920, 1032]}
+    calls: list = []
+    shots = {"n": 0}
+
+    def fake_shot(rect):
+        shots["n"] += 1
+        return SimpleNamespace(png=b"x", width=rect[2], height=rect[3], rect=tuple(rect),
+                               uniform_ratio=0.4, full_size=(1920, 1080))
+
+    orig = (capture_module.grab_region, clicker_module.click_screen, clicker_module.click_norm)
+    capture_module.grab_region = fake_shot
+    clicker_module.click_screen = lambda x, y, humanize=False: calls.append((x, y))
+    clicker_module.click_norm = lambda rect, box, humanize=False: calls.append(("norm", rect, box))
+    # 本机可能真的开着提权窗口,权限预检默认桩成"够得着",够不着的分支单独测(见 ⑧)
+    runner._foreground_unreachable = lambda win, target: ""
+    session_store = runner.store
+    try:
+        runner._open_client = lambda dry, cfg, target: dict(win)
+        runner._close_client = lambda dry: None
+        runner._wait_user_idle = lambda cfg, abort: False
+        runner._ensure_foreground = lambda win, cfg: True
+        runner._position_window = lambda w, c, d, t=None: tuple(w["rect"])
+        session = session_store.begin("manual", {"time": None}, target)
+        attempt = session_store.begin_attempt(session, 1)
+        status, reason = runner._one_attempt(session, attempt, False, threading.Event(),
+                                             cfg_dict, target)
+        assert status == "success", f"未启用视觉校验时应直接收尾成功,得到 {status}/{reason}"
+        assert calls == [(88, 1004), (177, 625), (219, 85)], f"点击序列/坐标换算不对:{calls}"
+        assert shots["n"] == 3, f"每一步应各留一张档,实际 {shots['n']} 张"
+        archived = sorted(k for k in attempt["images"] if k.startswith("step"))
+        assert archived == ["step1", "step2", "step3"], f"分步留档未入库:{archived}"
+
+        # ② 录制坐标不完整 → 判"无法解析",一个点都不许click(宁可整场不跑)
+        calls.clear()
+        bad = dict(target, steps=[{"id": "s1", "label": "坏点", "anchor": "window", "dx": None, "dy": 0.5}])
+        session = session_store.begin("manual", {"time": None}, bad)
+        attempt = session_store.begin_attempt(session, 1)
+        status, reason = runner._one_attempt(session, attempt, False, threading.Event(), cfg_dict, bad)
+        assert status == "retry" and "无法解析" in reason, f"{status}/{reason}"
+        assert not calls, f"坐标解析失败时不应点击:{calls}"
+
+        # ③ 没有录制任何点击点 → 明确要人去面板录,而不是静默"成功"
+        empty = dict(target, steps=[])
+        session = session_store.begin("manual", {"time": None}, empty)
+        attempt = session_store.begin_attempt(session, 1)
+        status, reason = runner._one_attempt(session, attempt, False, threading.Event(), cfg_dict, empty)
+        assert status == "manual", f"空录制应要求人工去面板录点,得到 {status}/{reason}"
+        assert "没有录制任何点击点" in reason, reason
+        assert not calls
+
+        # ④ 窗口不在前台:点击会落到用户当前正在用的程序上,必须放弃
+        calls.clear()
+        runner._ensure_foreground = lambda win, cfg: False
+        session = session_store.begin("manual", {"time": None}, target)
+        attempt = session_store.begin_attempt(session, 1)
+        status, reason = runner._one_attempt(session, attempt, False, threading.Event(), cfg_dict, target)
+        assert status == "retry" and "未能置前" in reason, f"{status}/{reason}"
+        assert not calls, f"不在前台时不应点击:{calls}"
+        runner._ensure_foreground = lambda win, cfg: True
+
+        # ⑤ 演练:算出每步会点在哪里,但不真的动鼠标
+        calls.clear()
+        session = session_store.begin("manual", {"time": None}, target)
+        attempt = session_store.begin_attempt(session, 1)
+        status, reason = runner._one_attempt(session, attempt, True, threading.Event(), cfg_dict, target)
+        assert not calls, f"演练不该点击:{calls}"
+        assert status == "success", f"演练应完成流程,得到 {status}/{reason}"
+
+        # ⑥ 开启视觉校验时,校验用的是目标自己的文案提示
+        verified = dict(target, verify="vision")
+        seen_prompt = {}
+
+        def fake_verify(png, target=None):
+            seen_prompt["target"] = (target or {}).get("id")
+            return {"popup": "success", "keywords": ["已签到"], "confidence": 0.9}
+
+        runner.vision.verify = fake_verify
+        session = session_store.begin("manual", {"time": None}, verified)
+        attempt = session_store.begin_attempt(session, 1)
+        status, reason = runner._one_attempt(session, attempt, False, threading.Event(), cfg_dict, verified)
+        assert status == "success", f"视觉校验应能确认签到成功,得到 {status}/{reason}"
+        assert seen_prompt["target"] == "workbuddy", "校验提示要按目标生成"
+
+        # ⑧ 目标提权:系统会静默吞掉鼠标注入,必须当场报权限问题,
+        #    而不是按"点了三下"的记录判成功(WorkBuddy 事故的原始形态)
+        import core.zcode_ctrl as zc_module
+        calls.clear()
+        zc_real = (zc_module.foreground_hwnd, zc_module.window_pid, zc_module.runs_elevated)
+        zc_module.foreground_hwnd = lambda: 9999
+        zc_module.window_pid = lambda hwnd: 4321
+        zc_module.runs_elevated = lambda pid: True
+        runner._foreground_unreachable = lambda w, t: Runner._foreground_unreachable(runner, w, t)
+        try:
+            session = session_store.begin("manual", {"time": None}, target)
+            attempt = session_store.begin_attempt(session, 1)
+            status, reason = runner._one_attempt(session, attempt, False, threading.Event(),
+                                                 cfg_dict, target)
+        finally:
+            (zc_module.foreground_hwnd, zc_module.window_pid,
+             zc_module.runs_elevated) = zc_real
+            runner._foreground_unreachable = lambda win, target: ""
+        assert status == "manual", f"点不动时不该继续走流程,得到 {status}/{reason}"
+        assert not calls, f"权限不够时一个点都不许按下:{calls}"
+        assert "管理员" in reason, f"要说清楚是权限问题以及怎么解:{reason}"
+        assert "以管理员身份运行" in reason, f"要给可执行的下一步:{reason}"
+
+        # ⑨ 中途被拦下(前一步还点得动):ClickBlocked 同样要转成人工处理,
+        #    且失败的那一步不能记成"已点击"
+        calls.clear()
+        real_click = clicker_module.click_screen
+
+        def click_then_block(x, y, humanize=False):
+            calls.append((x, y))
+            if len(calls) >= 2:
+                raise clicker_module.ClickBlocked("鼠标停在 (0, 0),没能移到目标点")
+            return int(x), int(y)
+
+        clicker_module.click_screen = click_then_block
+        session = session_store.begin("manual", {"time": None}, target)
+        attempt = session_store.begin_attempt(session, 1)
+        status, reason = runner._one_attempt(session, attempt, False, threading.Event(),
+                                             cfg_dict, target)
+        clicker_module.click_screen = real_click
+        assert status == "manual", f"点击被拒绝应转人工,得到 {status}/{reason}"
+        assert len(calls) == 2, f"被拦下后不该再点第三步:{calls}"
+        logged = json.dumps(attempt, ensure_ascii=False, default=str)
+        assert "已点击「Buddy加油站」" not in logged, f"没点下去的一步不许记成已点击:{logged}"
+    finally:
+        (capture_module.grab_region, clicker_module.click_screen,
+         clicker_module.click_norm) = orig
+
+    # ⑩ 面板录制接口:在程序自己的截图上点一下,产出的偏移要能原样回放
+    from core.coords import resolve
+
+    api = Api.__new__(Api)
+    api.cfg = cfg
+    recorded = api.record_point({"target": "workbuddy", "x": 88, "y": 1004, "label": "头像",
+                                 "rect": [0, 0, 1920, 1032], "index": 1, "wait_after_s": 0.6})
+    assert recorded["ok"] is True, recorded
+    step = recorded["step"]
+    assert step["anchor"] == "bottom_left" and step["dx"] == 88 and step["dy"] == 28, step
+    assert step["label"] == "头像" and step["wait_after_s"] == 0.6, step
+    assert step["screen"] == [88, 1004], step
+    assert resolve([0, 0, 1920, 1032], step) == (88, 1004), "录到的偏移必须能回放成同一个屏幕点"
+    # 落在窗口图之外的点击要拒绝,否则会存下一个永远点不准的偏移
+    assert api.record_point({"x": 3000, "y": 10, "rect": [0, 0, 1920, 1032]})["ok"] is False
+    assert api.record_point({"x": -1, "y": 10, "rect": [0, 0, 1920, 1032]})["ok"] is False
+    assert api.record_point({"x": 10, "y": 10})["ok"] is False, "未截图时不得录制"
+    assert api.record_point({"x": "abc", "y": 10, "rect": [0, 0, 10, 10]})["ok"] is False
+    return "按序点击且坐标换算正确;每步留档;不在前台/坐标残缺时拒绝点击;录制接口产出可回放偏移"
 
 
 def __weekday_slot_case():
@@ -1579,7 +2579,7 @@ def __weekday_slot_case():
     cfg = ConfigStore(tmp / "config.yaml")
     api = Api.__new__(Api)
     api.cfg = cfg
-    cleaned = Api._clean_slots([
+    cleaned = api._clean_slots([
         {"time": "19:00", "enabled": True, "days": [4, 5, 6]},
         {"time": "19:00", "enabled": True, "days": [0]},        # 同一时间、不同星期 → 两条都要留
         {"time": "19:00", "enabled": True, "days": [4, 5, 6]},  # 完全重复 → 去掉

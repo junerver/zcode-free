@@ -24,9 +24,10 @@
       <button class="tab active" data-page="dashboard" type="button"><span class="idx">01</span><span class="name">概览</span></button>
       <button class="tab" data-page="flow" type="button"><span class="idx">02</span><span class="name">流程</span></button>
       <button class="tab" data-page="schedule" type="button"><span class="idx">03</span><span class="name">场次表</span></button>
-      <button class="tab" data-page="vision" type="button"><span class="idx">04</span><span class="name">识别</span></button>
-      <button class="tab" data-page="logs" type="button"><span class="idx">05</span><span class="name">运行日志</span></button>
-      <button class="tab" data-page="settings" type="button"><span class="idx">06</span><span class="name">设置</span></button>
+      <button class="tab" data-page="targets" type="button"><span class="idx">04</span><span class="name">签到目标</span></button>
+      <button class="tab" data-page="vision" type="button"><span class="idx">05</span><span class="name">识别</span></button>
+      <button class="tab" data-page="logs" type="button"><span class="idx">06</span><span class="name">运行日志</span></button>
+      <button class="tab" data-page="settings" type="button"><span class="idx">07</span><span class="name">设置</span></button>
     </nav>
 
     <div class="sidebar-foot">
@@ -59,7 +60,7 @@
         <span class="box" aria-hidden="true"></span>
         <span class="switch-label">总开关</span>
       </label>
-      <button id="runOnce" class="btn solid" type="button">试领一次</button>
+      <button id="runOnce" class="btn solid" type="button" title="按签到目标页的顺序把启用的目标都跑一遍;只想测一个请用概览页「手动测试」里的目标下拉">试领一次</button>
     </header>
 
     <!-- 执行/结果提示条:只在主区内、顶栏下方,不覆盖侧栏 -->
@@ -90,9 +91,8 @@
 
         <div class="cards">
           <div class="card">
-            <div class="card-label">本周福利</div>
-            <div class="value" id="cardWeekly">--</div>
-            <div class="sub" id="cardWeeklySub">—</div>
+            <div class="card-label">签到目标 · 本周期</div>
+            <div class="tgt-rows" id="targetPeriods"></div>
           </div>
           <div class="card">
             <div class="card-label">下场时间</div>
@@ -121,12 +121,15 @@
             <div class="section-head">
               <span class="sec-idx">手动测试</span>
               <span class="sec-note">不进调度,点一下立刻跑一次</span>
+              <span class="spacer"></span>
+              <label class="run-target-label" for="runTarget">目标</label>
+              <select id="runTarget" class="run-target" title="只跑选中的目标;留「全部目标」则按顺序挨个跑"></select>
             </div>
             <div class="row wrap">
               <button class="btn solid" id="runOncePage" type="button">试领一次(完整流程)</button>
               <button class="btn" id="runDryPage" type="button">演练一次(不点击、不关客户端)</button>
             </div>
-            <p class="hint">完整流程:打开或复用 ZCode → 置顶窗口后截图 → 视觉识别领取按钮 → 点击 → 等待结果(几十秒内反复确认);未成功则关闭客户端,等 5 秒重开,最多 5 次。演练模式同样先置顶再截图识别,但不移动鼠标、不关闭客户端。</p>
+            <p class="hint">完整流程:打开或复用目标客户端 → 置顶窗口后截图 → 按该目标的流程点击(视觉识别或录制坐标)→ 等待结果;未成功则关闭客户端重开重试。演练模式同样先置顶再截图,但不移动鼠标、不关闭客户端。<b>多个目标时建议先只选一个跑</b>,否则前一个目标的重试会把后面几个拖到很久之后。</p>
           </div>
 
           <div class="panel" id="setupPanel">
@@ -159,6 +162,7 @@
             <div class="section-head">
               <span class="sec-idx">本次执行</span>
               <span class="sec-note mono" id="liveSession"></span>
+              <span class="chip-chip" id="liveTarget">--</span>
               <span class="spacer"></span>
               <span class="mono" id="liveAttempt"></span>
             </div>
@@ -179,7 +183,7 @@
           </div>
           <div class="table-scroll">
           <table class="table" id="recentTable">
-            <thead><tr><th style="width:130px">时间</th><th style="width:110px">场次</th><th style="width:100px">结果</th><th>说明</th><th style="width:80px" class="ta-r">尝试</th><th style="width:90px"></th></tr></thead>
+            <thead><tr><th style="width:130px">时间</th><th style="width:96px">场次</th><th style="width:104px">目标</th><th style="width:92px">结果</th><th>说明</th><th style="width:70px" class="ta-r">尝试</th><th style="width:84px"></th></tr></thead>
             <tbody></tbody>
           </table>
           <div class="empty hidden" id="recentEmpty">暂无记录,等待第一场执行</div>
@@ -205,6 +209,7 @@
             <span class="sec-idx">整体流程</span>
             <span class="sec-note">到点或手动触发后,一次领取的完整生命周期</span>
             <span class="spacer"></span>
+            <span class="chip-chip" id="flowTarget">未运行</span>
             <span class="chip-chip" id="flowPhase">空闲</span>
           </div>
           <div class="flow" id="flowMain">
@@ -312,7 +317,7 @@
           <div class="panel wide">
             <div class="section-head">
               <span class="sec-idx">场次表</span>
-              <span class="sec-note">默认每天;可只勾选特定星期(如只排周五/周六/周日)</span>
+              <span class="sec-note">默认每天;可只勾选特定星期,也可指定这一场只跑某个目标</span>
               <span class="spacer"></span>
               <button class="btn small" id="addSlot" type="button">添加场次</button>
             </div>
@@ -322,6 +327,7 @@
                   <span>启用</span>
                   <span>时间</span>
                   <span>重复</span>
+                  <span>目标</span>
                   <span>尝试 / 间隔</span>
                   <span>最近结果</span>
                   <span></span>
@@ -330,7 +336,7 @@
             </div>
             <div class="empty hidden" id="slotEmpty">还没有场次,点右上角「添加场次」创建第一场</div>
             <div class="slot-foot">
-              <span>修改后立即保存并生效,调度器热重载,无需重启。「重复」不点亮任何星期表示每天。</span>
+              <span>修改后立即保存并生效,调度器热重载,无需重启。「重复」不点亮任何星期表示每天;「目标」留「全部目标」表示按签到目标页的顺序挨个跑。</span>
               <span class="spacer"></span>
               <span class="mono" id="slotCount">0 个场次</span>
             </div>
@@ -355,7 +361,160 @@
         </div>
       </section>
 
-      <!-- ================= 04 识别 ================= -->
+      <!-- ================= 04 签到目标 ================= -->
+      <section id="page-targets" class="page hidden">
+        <div class="dash-grid">
+          <div class="panel wide">
+            <div class="section-head">
+              <span class="sec-idx">签到目标</span>
+              <span class="sec-note">顺序即执行顺序;「全部目标」的场次会挨个跑一遍</span>
+              <span class="spacer"></span>
+              <button class="btn small" id="addTarget" type="button">添加目标</button>
+            </div>
+            <div class="tgt-scroll">
+              <div class="tgt-list" id="targetList">
+                <div class="tgt-head-row">
+                  <span></span>
+                  <span>名称 / ID</span>
+                  <span>程序</span>
+                  <span>流程</span>
+                  <span>周期</span>
+                  <span>坐标</span>
+                  <span>状态</span>
+                  <span>启用</span>
+                  <span></span>
+                  <span></span>
+                </div>
+              </div>
+            </div>
+            <div class="empty hidden" id="targetEmpty">还没有签到目标,点右上角「添加目标」</div>
+            <div class="slot-foot">
+              <span>删除前请确认它没被场次单独引用;至少保留一个目标,否则所有场次都会报「无签到目标」。</span>
+              <span class="spacer"></span>
+              <span class="mono" id="targetCount">0 个目标</span>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="section-head">
+              <span class="sec-idx">目标配置</span>
+              <span class="sec-note">在左侧点选一个目标后编辑,改动即时保存</span>
+              <span class="spacer"></span>
+              <span class="mono" id="editTargetName">未选择目标</span>
+            </div>
+            <div class="settings-grid">
+              <div class="field">
+                <label for="tgName">显示名称</label>
+                <input type="text" id="tgName" placeholder="ZCode" />
+              </div>
+              <div class="field">
+                <label for="tgId">标识(小写字母数字)</label>
+                <input type="text" id="tgId" placeholder="zcode" />
+              </div>
+              <div class="field span4">
+                <label for="tgExe">程序路径</label>
+                <div class="path-row">
+                  <input type="text" id="tgExe" class="mono" placeholder="C:\Program Files\App\App.exe" />
+                  <button class="btn small" id="btnDetectTarget" type="button">探测路径</button>
+                </div>
+              </div>
+              <div class="field">
+                <label for="tgFindBy">窗口查找方式</label>
+                <select id="tgFindBy"></select>
+              </div>
+              <div class="field">
+                <label for="tgTitle">窗口标题关键字</label>
+                <input type="text" id="tgTitle" placeholder="留空表示自动" />
+              </div>
+              <div class="field">
+                <label for="tgFlow">领取流程</label>
+                <select id="tgFlow"></select>
+              </div>
+              <div class="field">
+                <label for="tgVerify">结果校验</label>
+                <select id="tgVerify"></select>
+              </div>
+              <div class="field">
+                <label for="tgOnce">领取周期</label>
+                <select id="tgOnce"></select>
+              </div>
+              <div class="field">
+                <label for="tgWait">启动后等待(s)</label>
+                <input type="number" id="tgWait" min="0" max="120" step="1" />
+              </div>
+              <div class="field">
+                <label>窗口摆放</label>
+                <label class="check"><input type="checkbox" id="tgFullscreen" /><span>执行前最大化到全屏(坐标录制依赖这个尺寸)</span></label>
+              </div>
+            </div>
+            <div class="row">
+              <button class="btn" id="btnSaveTarget" type="button">保存目标</button>
+              <button class="btn small" id="btnRunTargetDry" type="button">只演练这个目标</button>
+              <button class="btn small" id="btnRunTarget" type="button">只试跑这个目标</button>
+              <span class="muted">「不限周期」= 每一场都执行,不会因为本周已领而跳过</span>
+            </div>
+            <div class="result hidden" id="tgtDetectResult"></div>
+            <p class="hint">「按进程」用程序名找已开着的窗口;「按标题」按关键字匹配标题,适合一个进程开多窗口的应用。探测路径会扫描开始菜单与常见安装目录。</p>
+          </div>
+
+          <div class="panel wide hidden" id="recorderPanel">
+            <div class="section-head">
+              <span class="sec-idx">坐标录制</span>
+              <span class="sec-note" id="recTargetName">—</span>
+              <span class="spacer"></span>
+              <button class="btn small hidden" id="btnCaptureLaunch" type="button">启动并截图</button>
+              <button class="btn small" id="btnCapture" type="button">截图</button>
+              <button class="btn small" id="btnProbe" type="button">校验坐标</button>
+            </div>
+            <div class="result hidden" id="recMessage"></div>
+            <div class="rec-mode" id="recMode">
+              <button class="btn small" type="button" data-rmode="steps">录到签到点击</button>
+              <button class="btn small" type="button" data-rmode="post">录到领取后补关</button>
+              <span class="sec-note" id="recModeHint">在图上点击要按的位置,每点一次记一步。</span>
+            </div>
+            <div class="rec-stage">
+              <img id="recImage" class="hidden" alt="目标窗口截图" />
+              <div class="rec-marks" id="recMarks"></div>
+              <div class="empty" id="recNoShot">先打开应用(或点「启动并截图」),截到窗口图后在图上点击要按的位置,每点一次记一步。</div>
+            </div>
+            <p class="hint">录制点存的是「相对窗口某个角的偏移」,不是绝对屏幕坐标:窗口位置或大小变了会按同一锚点重新换算。 banner 会自动跳走的,把等待秒数填 0、紧接着录下一个点。</p>
+            <div id="claimSteps">
+              <div class="step-head-row">
+                <span class="mono">步</span>
+                <span>动作说明</span>
+                <span>锚点</span>
+                <span>横向偏移(px)</span>
+                <span>纵向偏移(px)</span>
+                <span>点后等待(s)</span>
+                <span></span>
+              </div>
+              <div class="step-list" id="stepList"></div>
+              <div class="empty hidden" id="stepsEmpty">还没有录制任何点击点</div>
+            </div>
+            <div class="step-head-row post-head-row">
+              <span class="mono">补关</span>
+              <span>动作说明</span>
+              <span>锚点</span>
+              <span>横向偏移(px)</span>
+              <span>纵向偏移(px)</span>
+              <span>点后等待(s)</span>
+              <span></span>
+            </div>
+            <div class="step-list" id="postStepList"></div>
+            <div class="empty hidden" id="postStepsEmpty">
+              还没有补关点:领取成功后的浮窗会一直盖在页面上,下一场开场第一下就点在浮窗自己身上,
+              既领不到也认不出界面。截一张领取成功之后的图,在图上点一下浮窗的关闭按钮记为一步。
+            </div>
+            <div class="slot-foot">
+              <span>「演练」按坐标走一遍但不点击;「试跑」会真实点击一次,跑完可在运行日志里看每步留档的截图。</span>
+              <span class="spacer"></span>
+              <span class="mono" id="recStepCount">0 步</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= 05 识别 ================= -->
       <section id="page-vision" class="page hidden">
         <div class="panel">
           <div class="section-head">
@@ -476,8 +635,9 @@
             <span class="sec-note">只跑一次视觉,不会点击</span>
             <span class="spacer"></span>
             <div class="row">
+              <select id="vTargetSel" title="按哪个签到目标测试" aria-label="签到目标"></select>
               <select id="locateSource">
-                <option value="window">截取 ZCode 窗口</option>
+                <option value="window">截取目标窗口</option>
                 <option value="screen">截取整屏</option>
               </select>
               <button class="btn small" id="btnTestLocate" type="button">开始测试</button>
@@ -486,11 +646,11 @@
           <div id="locatePlaceholder" class="locate-placeholder">
             <div class="lp-left">
               <b>还没有测试过</b>
-              <span>点右上「开始测试」会截一张 ZCode 窗口图,把模型找到的领取按钮用红框圈出来,并显示模型返回的 JSON。这一步只识别,不会点击任何东西。</span>
+              <span>选好签到目标后点右上「开始测试」,会截一张该应用的窗口图,把模型找到的领取按钮用红框圈出来,并显示模型返回的 JSON。这一步只识别,不会点击任何东西。</span>
             </div>
             <div class="lp-steps">
-              <div class="lp-step"><i class="mono">01</i><span>打开客户端(福利卡片在窗口左下角)</span></div>
-              <div class="lp-step"><i class="mono">02</i><span>选「截取 ZCode 窗口」后开始测试</span></div>
+              <div class="lp-step"><i class="mono">01</i><span>打开目标应用(ZCode 的福利卡片在窗口左下角)</span></div>
+              <div class="lp-step"><i class="mono">02</i><span>选好目标与「截取目标窗口」后开始测试</span></div>
               <div class="lp-step"><i class="mono">03</i><span>红框没圈住领取按钮,再调阈值与词表</span></div>
             </div>
           </div>
@@ -503,20 +663,47 @@
               </div>
               <pre class="json" id="locateJson"></pre>
             </div>
-            <p class="hint">红框由模型返回的 button_box 换算而来。框画错了先确认左下角的福利卡片确实在画面上(卡片不在时不会有按钮),再调阈值与词表。</p>
+            <p class="hint">红框由模型返回的 button_box 换算而来。框画错了先确认左下角的福利卡片确实在画面上(卡片不在时不会有按钮),再调阈值与词表。「固定坐标」的目标不跑视觉定位,这一步仅供参考。</p>
           </div>
         </div>
 
         <div class="panel">
+          <div class="section-head">
+            <span class="sec-idx">校验自检</span>
+            <span class="sec-note">用所选目标的校验提示词判一次画面,用来校准词表</span>
+            <span class="spacer"></span>
+            <div class="row">
+              <label class="check" title="点击后卡片整张消失会被视为已领取"><input type="checkbox" id="vClicked" checked /><span>按已点击过判定</span></label>
+              <select id="vVerifySource">
+                <option value="window">截取目标窗口</option>
+                <option value="screen">截取整屏</option>
+              </select>
+              <button class="btn small" id="btnTestVerify" type="button">开始校验测试</button>
+            </div>
+          </div>
+          <div class="result hidden" id="verifyResult"></div>
+          <div class="locate-grid hidden" id="verifyGrid">
+            <div class="locate-wrap"><img id="verifyImage" alt="校验截图" /></div>
+            <pre class="json" id="verifyJson"></pre>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="section-head">
+            <span class="sec-idx">识别提示词(只读)</span>
+            <span class="sec-note">随上方「测试识别」的目标变化</span>
+            <span class="spacer"></span>
+            <span class="sec-note mono" id="promptTargetNote">—</span>
+          </div>
           <details>
-            <summary class="sec-idx">识别提示词(只读)</summary>
+            <summary class="sec-idx">查看 Prompt</summary>
             <div class="prompts" style="margin-top:11px">
               <div>
                 <h4>定位 Prompt</h4>
                 <pre class="json" id="locatePromptText"></pre>
               </div>
               <div>
-                <h4>校验 Prompt</h4>
+                <h4>校验 Prompt(所选目标实际生效的那份)</h4>
                 <pre class="json" id="verifyPromptText"></pre>
               </div>
             </div>
@@ -524,7 +711,7 @@
         </div>
       </section>
 
-      <!-- ================= 05 运行日志 ================= -->
+      <!-- ================= 06 运行日志 ================= -->
       <section id="page-logs" class="page hidden">
         <div class="logs-layout">
           <div class="panel">
@@ -559,50 +746,27 @@
         </div>
       </section>
 
-      <!-- ================= 06 设置 ================= -->
+      <!-- ================= 07 设置 ================= -->
       <section id="page-settings" class="page hidden">
         <div class="panel">
           <div class="section-head">
-            <span class="sec-idx">程序与 ZCode</span>
-            <span class="sec-note">改完即存盘,不需要点保存</span>
+            <span class="sec-idx">运行模式与领取记账</span>
+            <span class="sec-note">这里只有全局项;每个应用的周期在「签到目标」页设置</span>
           </div>
-          <div class="settings-grid">
-            <div class="field span2">
-              <label for="sZcodePath">ZCode 程序路径</label>
+          <div class="settings-grid" style="grid-template-columns:repeat(2,minmax(0,1fr))">
+            <div class="field">
+              <label for="sDryRun">演练模式(全局)</label>
+              <label class="check"><input type="checkbox" id="sDryRun" /><span>开启后所有场次只截图识别,不点击、不关客户端</span></label>
+            </div>
+            <div class="field">
+              <label>领取记账</label>
               <div class="row">
-                <input type="text" id="sZcodePath" class="mono" placeholder="留空则自动探测" />
-                <button class="btn small" id="btnDetect" type="button">自动探测</button>
-              </div>
-            </div>
-            <div class="field">
-              <label for="sTitleMatch">窗口标题匹配</label>
-              <input type="text" id="sTitleMatch" class="mono" placeholder="ZCode" />
-            </div>
-            <div class="field">
-              <label for="sStartupWait">启动后等待加载(s)</label>
-              <input type="number" id="sStartupWait" min="0" max="60" step="0.5" />
-            </div>
-
-            <div class="field span2">
-              <label for="sFullscreen">执行前全屏显示</label>
-              <label class="check"><input type="checkbox" id="sFullscreen" /><span>把客户端最大化后再截图(推荐,识别更稳)</span></label>
-            </div>
-            <div class="field span2">
-              <label for="sRestore">每次复位窗口位置</label>
-              <label class="check"><input type="checkbox" id="sRestore" /><span>未启用全屏时:执行前把窗口移到固定位置</span></label>
-            </div>
-
-            <div class="field span2">
-              <label>窗口位置 x / y / 宽 / 高</label>
-              <div class="rect-row">
-                <input type="number" id="sRectX" class="mono" aria-label="窗口 x" />
-                <input type="number" id="sRectY" class="mono" aria-label="窗口 y" />
-                <input type="number" id="sRectW" class="mono" aria-label="窗口宽" />
-                <input type="number" id="sRectH" class="mono" aria-label="窗口高" />
+                <button class="btn" id="btnClearClaims">清除领取记账</button>
+                <span class="muted">记账按目标分开,清掉后本周期可重跑</span>
               </div>
             </div>
           </div>
-          <div class="result hidden" id="detectResult"></div>
+          <p class="hint">「每天一次 / 每周一次」是逐个目标的能力,配在签到目标页:某目标本周期已领到,后续场次会静默跳过,不再白开客户端与视觉调用。手动「试领一次」不受周期限制。</p>
         </div>
 
         <div class="panel">
@@ -661,28 +825,6 @@
             </div>
           </div>
           <p class="hint">点击后服务端要花几十秒发放,程序会在「等待领取结果上限」内反复截图确认(界面停在加载动画上时继续等,不算失败);单次尝试超时会中止本场并通知。</p>
-        </div>
-
-        <div class="panel">
-          <div class="section-head">
-            <span class="sec-idx">每周机会</span>
-            <span class="sec-note">福利一周只有一次,周期从周五算起</span>
-            <span class="spacer"></span>
-            <span class="muted" id="weeklyState">--</span>
-          </div>
-          <div class="settings-grid" style="grid-template-columns:repeat(2,minmax(0,1fr))">
-            <div class="field">
-              <label for="sWeeklyOnce">一周只领一次</label>
-              <label class="check"><input type="checkbox" id="sWeeklyOnce" /><span>本周领到后,剩余场次自动跳过(配置保留,下周五恢复)</span></label>
-            </div>
-            <div class="field">
-              <label>本周状态</label>
-              <div class="row">
-                <button class="btn" id="btnClearWeekly">清除本周已领记录</button>
-              </div>
-            </div>
-          </div>
-          <p class="hint">只在周五开机跑工具时最实用:周五成功后,周六到周四的场次不会再空跑(省下反复开客户端与两次视觉调用),下周五自动重新开始。手动「试领一次」不受此限制。</p>
         </div>
 
         <div class="dash-grid">
@@ -768,6 +910,7 @@
 <script src="assets/js/pages/dashboard.js"></script>
 <script src="assets/js/pages/flow.js"></script>
 <script src="assets/js/pages/schedule.js"></script>
+<script src="assets/js/pages/targets.js"></script>
 <script src="assets/js/pages/vision.js"></script>
 <script src="assets/js/pages/logs.js"></script>
 <script src="assets/js/pages/settings.js"></script>

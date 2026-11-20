@@ -3,21 +3,24 @@
   const $ = (id) => document.getElementById(id);
   window.PAGES = window.PAGES || {};
 
-  // 流程图节点顺序(与 runner 的步骤名一一对应)
+  // 流程图节点顺序(视觉流程与 runner 的步骤名一一对应)
   const ORDER = ['trigger', 'open', 'shot1', 'locate', 'click', 'verify', 'done'];
   const STEP_TO_NODE = {
     '打开客户端': 'open',
     '截图': 'shot1',
     '识别按钮': 'locate',
     '点击领取': 'click',
+    '按坐标点击': 'click',      // 固定坐标流程:点击一步换成录制好的坐标
     '校验结果': 'verify',
     '收尾': 'done',
   };
+  // 只有视觉流程会走的两步:跑固定坐标时把它们压暗,免得被读成"也截了图去识别"
+  const VISION_ONLY = ['shot1', 'locate'];
   const END_LABEL = {
     success: '成功', failed: '失败', need_manual: '需人工',
     aborted: '已中止', dry_run: '演练完成',
     not_available: '无需领取',
-    skipped: '本周已领取,跳过',
+    skipped: '本周期已领取,跳过',
   };
 
   const nodes = {};
@@ -26,6 +29,7 @@
   let visited = new Set();
   let failed = new Set();
   let current = null;
+  let visionOnlyDim = false;    // 本次是固定坐标流程
 
   function resetPath(withTrigger) {
     // 触发节点贯穿整个会话;每次重试只重置"本次尝试"走过的路径
@@ -39,6 +43,7 @@
     ORDER.forEach((id) => {
       const el = nodes[id];
       if (!el) return;
+      el.classList.toggle('skip', visionOnlyDim && VISION_ONLY.indexOf(id) >= 0);
       el.classList.toggle('fail', failed.has(id));
       el.classList.toggle('active', current === id && !failed.has(id));
       el.classList.toggle('done', visited.has(id) && current !== id && !failed.has(id));
@@ -66,6 +71,15 @@
     if (el) el.textContent = text;
   }
 
+  // 一次场次可能挨个跑多个目标,这里显示"当前在跑哪个 + 第几个"
+  function setTarget(name, index, total) {
+    const el = $('flowTarget');
+    if (!el) return;
+    const label = name || '未运行';
+    el.textContent = total > 1 ? label + ' ' + index + '/' + total : label;
+    el.classList.toggle('muted', !name);
+  }
+
   window.PAGES.flow = {
     init() {
       ORDER.forEach((id) => {
@@ -73,14 +87,18 @@
       });
 
       EV.on('exec_start', (event) => {
-        if (event && event.skipped) {
-          // 本周已领到的跳过场次没有流程可画:直接落结果标签,不亮「执行中」
+        const ev = event || {};
+        visionOnlyDim = ev.flow === 'steps';
+        setTarget(ev.target_name, 1, 1);
+        if (ev.skipped) {
+          // 本周期已领到的跳过场次没有流程可画:直接落结果标签,不亮「执行中」
           resetPath(false);
           setPhase(END_LABEL.skipped);
           return;
         }
         resetPath(true);
-        setPhase((event && event.dry_run ? '演练中' : '执行中') + ' · 打开客户端');
+        // 相位名来自后端(视觉五步 / 固定坐标四步),流程图只画视觉那条链
+        setPhase((ev.dry_run ? '演练中' : '执行中') + ' · ' + ((ev.steps || [])[0] || '打开客户端'));
       });
 
       EV.on('step_update', (event) => {
@@ -110,7 +128,8 @@
         }
         current = null;
         render();
-        setPhase(END_LABEL[event.status] || event.status || '空闲');
+        setPhase((event.target_name ? event.target_name + ':' : '') +
+          (END_LABEL[event.status] || event.status || '空闲'));
         if (event.status === 'success') flash('ok');
         else if (event.status === 'need_manual') flash('manual');
         else if (event.status === 'failed') flash('retry');
@@ -120,12 +139,18 @@
     async onShow() {
       try {
         const state = await window.API.call('get_state');
-        if (state && state.current && state.current.step) {
+        const cur = state && state.current;
+        if (cur && cur.step) {
+          visionOnlyDim = cur.flow === 'steps';
           resetPath(true);
-          applyStep(state.current.step, 'ok');
-          lastAttempt = state.current.attempt || 0;
-          setPhase('执行中 · 第 ' + lastAttempt + ' 次尝试');
+          applyStep(cur.step, 'ok');
+          lastAttempt = cur.attempt || 0;
+          setTarget(cur.target_name, cur.target_index || 1, cur.targets_total || 1);
+          // 相位表由后端给出(视觉五步 / 固定坐标四步),这里按当前那步显示
+          setPhase('执行中' + (lastAttempt ? ' · 第 ' + lastAttempt + ' 次尝试' : '') +
+            ' · ' + (cur.step || (cur.steps || [])[0] || '打开客户端'));
         } else if (!current && !visited.size) {
+          setTarget('');
           setPhase('空闲');   // 若还画着上次的路径,保留那次的结果标签
         }
       } catch (err) { /* 忽略:仅影响高亮 */ }

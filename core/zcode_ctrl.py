@@ -1,13 +1,23 @@
-"""ZCode 客户端进程与窗口控制(Windows / pywin32)。
+"""客户端进程与窗口控制(Windows / pywin32)。
 
 职责:探测 exe、枚举窗口、启动/置前/复位窗口、结束进程树。
-只操作「标题匹配到的那个窗口及其进程」,不碰其他程序。
+只操作「目标 exe 自己的主窗口」,不碰其他程序。
+
+两个用血泪换来的规矩:
+1. 先认进程、再认窗口。按标题找窗口会被同名无关窗口/自己弹出的对话框截胡,
+   所以入口是 find_process_window(exe):用 pid→可执行路径(严格比对)锁定进程,
+   再在该进程的窗口里取最大那个。
+2. 绝不把本程序自己当成客户端。打包后的进程名 ZCodeAssistant.exe 里含 "zcode",
+   子串匹配会命中它,于是"启动客户端"变成启动第二个自己 → 单实例提示框 →
+   提示框标题也含 ZCode → 被当客户端最大化 → 视觉模型报"有弹窗遮挡" → 无限重试。
 """
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -19,13 +29,49 @@ from loguru import logger
 
 STILL_ACTIVE = 259
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_TOKEN_QUERY = 0x0008
+_TOKEN_INTEGRITY_LEVEL = 25                    # TOKEN_INFORMATION_CLASS.TokenIntegrityLevel
+_TOKEN_APIS_READY = False
 
 VK_MENU = 0x12                                  # ALT
 MODIFIER_KEYS = {"ALT": VK_MENU, "CTRL": 0x11, "SHIFT": 0x10, "WIN": 0x5B}
 
+# 主窗口的最小尺寸:弹出框、气泡、隐藏的消息窗口都比这小,不该被当成客户端
+MIN_WINDOW_W = 400
+MIN_WINDOW_H = 300
+
 
 class LASTINPUTINFO(ctypes.Structure):
     _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_void_p)]
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_void_p)]
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD),
+                ("wParamH", wintypes.WORD)]
+
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT), ("hi", _HARDWAREINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wintypes.DWORD), ("u", _INPUT_UNION)]
+
+
+_INPUT_KEYBOARD = 1
 
 # 任何情况下都不得结束的进程:系统外壳/关键进程 + 本程序自身
 # (实测事故:标题为 "zcode-free" 的窗口被误当成 ZCode 客户端,进程随后被结束)
@@ -43,6 +89,36 @@ def is_protected_exe(path: str | None) -> bool:
     return bool(path) and Path(path).name.lower() in PROTECTED_EXES
 
 
+_OWN_EXE: str | None = None
+_OWN_ALT: str = ""
+
+
+def own_exe() -> str:
+    """本程序自身的可执行文件路径。
+
+    打包后就是 ZCodeAssistant.exe;源码运行时是解释器本身。这里取的是**进程镜像路径**
+    (而不是 sys.executable):venv 下两者不同,而枚举其它进程时拿到的也是镜像路径,
+    只有同一个口径才比对得上。
+    """
+    global _OWN_EXE, _OWN_ALT
+    if _OWN_EXE is None:
+        launcher = str(sys.executable) if sys.executable else ""
+        image = "" if getattr(sys, "frozen", False) else (process_path(os.getpid()) or "")
+        _OWN_EXE = image or launcher
+        # 包装器/venv 场景下 sys.executable 与镜像路径不是一个文件,两个都算"自己"
+        _OWN_ALT = launcher if launcher and not _same_path(launcher, _OWN_EXE) else ""
+    return _OWN_EXE
+
+
+def is_own_exe(path: str | None) -> bool:
+    """是否就是正在运行的这个程序自身——任何「找客户端」「结束进程」的入口都必须排除它。"""
+    if not path or not own_exe():
+        return False
+    if _same_path(path, own_exe()):
+        return True
+    return bool(_OWN_ALT) and _same_path(path, _OWN_ALT)
+
+
 def _same_path(a: str, b: str) -> bool:
     try:
         return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
@@ -52,10 +128,10 @@ def _same_path(a: str, b: str) -> bool:
 
 def verify_client_window(win: dict | None, expected_exe: str = "",
                          exe_name_match: str = "zcode") -> tuple[bool, str]:
-    """确认窗口确实属于 ZCode 客户端,返回 (是否通过, 原因)。
+    """确认窗口确实属于目标客户端,返回 (是否通过, 原因)。
 
     只靠标题匹配是不够的:标题里恰好含 "zcode" 的窗口(项目文件夹名、面板网页
-    "ZCode 福利助手"、同名目录窗口等)都会被误认。这里追加进程级校验:
+    "ZCode 福利助手"、本程序自己弹出的对话框等)都会被误认。这里追加进程级校验:
     优先与配置的 exe 路径严格比对;未配置路径时要求进程名含关键字且不是受保护进程。
     """
     win = win or {}
@@ -67,7 +143,9 @@ def verify_client_window(win: dict | None, expected_exe: str = "",
         return False, "无法获取窗口所属进程"
     path = process_path(pid)
     if not path:
-        return False, f"无法读取进程路径(PID {pid},可能权限不足)"
+        return False, f"无法读取进程路径(PID {pid},可能权限不足或进程已退出)"
+    if is_own_exe(path):
+        return False, f"进程 {path} 是本程序自身,不能作为签到目标"
     name = Path(path).name.lower()
     if name in PROTECTED_EXES:
         return False, f"进程 {name} 属于受保护/无关程序,已排除"
@@ -104,6 +182,107 @@ def wait_client_window(title_match: str, timeout: float, expected_exe: str = "")
     return None
 
 
+def pids_of_exe(exe: str) -> list[int]:
+    """列出正在运行的、可执行文件与 exe 严格一致的进程(排除本程序自己)。"""
+    if not exe:
+        return []
+    try:
+        candidates = list(win32process.EnumProcesses())
+    except Exception:
+        return []
+    out: list[int] = []
+    for pid in candidates:
+        if pid <= 4:
+            continue
+        path = process_path_cached(int(pid))
+        if not path or is_own_exe(path):
+            continue
+        if _same_path(path, exe):
+            out.append(int(pid))
+    return out
+
+
+def windows_of_pid(pid: int) -> list[dict]:
+    """某进程的全部可见窗口,按面积从大到小。
+
+    优先返回无主窗口(顶层框架);一个都没有时才退回带 owner 的窗口,
+    以免 Electron/Chromium 系应用因窗口归属实现差异而完全找不到画面。
+    """
+    owned: list[dict] = []
+    root: list[dict] = []
+
+    def _cb(hwnd, _):
+        try:
+            if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
+                return True
+            if window_pid(hwnd) != pid:
+                return True
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        except Exception:
+            return True
+        w, h = right - left, bottom - top
+        if w < MIN_WINDOW_W or h < MIN_WINDOW_H:
+            return True
+        try:
+            title = win32gui.GetWindowText(hwnd) or ""
+        except Exception:
+            title = ""
+        item = {"hwnd": hwnd, "title": title, "rect": [left, top, w, h], "area": w * h}
+        try:
+            has_owner = bool(win32gui.GetWindow(hwnd, win32con.GW_OWNER))
+        except Exception:
+            has_owner = False
+        (owned if has_owner else root).append(item)
+        return True
+
+    win32gui.EnumWindows(_cb, None)
+    out = root or owned
+    out.sort(key=lambda x: -x["area"])
+    return out
+
+
+def find_process_window(exe: str) -> dict | None:
+    """先按进程(路径严格比对)锁定 PID,再取该进程最大的窗口。
+
+    这是所有目标的默认查找方式:Trae 的主窗口标题是 "Agent",按标题根本找不到;
+    反过来 WorkBuddy 之类也会弹出标题含自身名字的对话框,按标题找就会挑到对话框。
+    """
+    for pid in pids_of_exe(exe):
+        wins = windows_of_pid(pid)
+        if wins:
+            win = wins[0]
+            win["pid"] = pid
+            return win
+    return None
+
+
+def wait_process_window(exe: str, timeout: float) -> dict | None:
+    """轮询等待目标进程的主窗口出现。"""
+    deadline = time.time() + max(float(timeout), 1.0)
+    while time.time() < deadline:
+        win = find_process_window(exe)
+        if win:
+            return win
+        time.sleep(0.5)
+    return None
+
+
+def find_target_window(target: dict) -> dict | None:
+    """按目标的 find_by 策略找到自己的主窗口。"""
+    exe = str(target.get("exe") or "").strip()
+    if target.get("find_by") == "title" or not exe:
+        return find_client_window(str(target.get("window_title_match") or ""), exe)
+    return find_process_window(exe)
+
+
+def wait_target_window(target: dict, timeout: float) -> dict | None:
+    exe = str(target.get("exe") or "").strip()
+    if target.get("find_by") == "title" or not exe:
+        return wait_client_window(
+            str(target.get("window_title_match") or ""), timeout, exe)
+    return wait_process_window(exe, timeout)
+
+
 # ---------------- 窗口 ----------------
 
 def list_windows(title_match: str) -> list[dict]:
@@ -125,7 +304,8 @@ def list_windows(title_match: str) -> list[dict]:
         except Exception:
             return True
         w, h = right - left, bottom - top
-        if w <= 0 or h <= 0:
+        # 尺寸闸:小对话框/气泡窗口即使标题对得上也不是我们要操作的主窗口
+        if w < MIN_WINDOW_W or h < MIN_WINDOW_H:
             return True
         out.append({"hwnd": hwnd, "title": title, "rect": [left, top, w, h], "area": w * h})
         return True
@@ -157,13 +337,84 @@ def is_foreground(hwnd: int) -> bool:
         return False
 
 
+def foreground_hwnd() -> int:
+    try:
+        return int(win32gui.GetForegroundWindow())
+    except Exception:
+        return 0
+
+
+def owns_foreground(hwnd: int) -> bool:
+    """前台要么是窗口本身,要么是它自己弹出来的浮层/菜单。
+
+    录制流程第二步点开的账户菜单、领取 banner 常常是同进程的另一个顶层窗口。
+    只认"主窗口必须在最前"就会去抢焦点,反而把下一步要点的那个弹窗关掉。
+    """
+    top = foreground_hwnd()
+    if not top:
+        return False
+    if top == hwnd:
+        return True
+    mine = window_pid(hwnd)
+    return bool(mine) and mine == window_pid(top)
+
+
+def send_key_events(events: list[tuple[int, int]]) -> bool:
+    """一次 SendInput 把整串按键事件发完(events 为 (vk, flags) 列表)。
+
+    批量很关键:keybd_event 分两次发"按下/抬起",中间只要前台一换(置前成功
+    必然导致前台一换),按下落在旧前台线程、抬起落在新前台线程,旧线程就永远
+    认为这个键还按着——用户看到的"操作一段后 ALT 卡在按下态"正是这个后遗症:
+    菜单栏莫名激活、点击变成 Alt+点击、焦点乱跳。同一批事件进同一个队列,不留缝。
+    """
+    if not events:
+        return True
+    buffer = (_INPUT * len(events))()
+    for index, (vk, flags) in enumerate(events):
+        buffer[index].type = _INPUT_KEYBOARD
+        buffer[index].ki.wVk = vk
+        buffer[index].ki.dwFlags = flags
+    user32 = ctypes.windll.user32
+    user32.SendInput.restype = wintypes.UINT
+    user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)
+    return user32.SendInput(len(events), buffer, ctypes.sizeof(_INPUT)) == len(events)
+
+
+def pulse_keys(vks: list[int]) -> bool:
+    """成对按下+抬起,且一次性发出。"""
+    events: list[tuple[int, int]] = []
+    for vk in vks:
+        events.append((vk, 0))
+        events.append((vk, win32con.KEYEVENTF_KEYUP))
+    return send_key_events(events)
+
+
+def release_keys(vks: list[int]) -> bool:
+    """只补发抬起事件。"""
+    return send_key_events([(vk, win32con.KEYEVENTF_KEYUP) for vk in vks])
+
+
+def stuck_modifier_keys() -> list[int]:
+    """线程队列里仍记着"按下"、但物理上并没有被按住的修饰键。
+
+    两个通道得一起看:GetAsyncKeyState 查"当下真按着吗",GetKeyState 查队列残留。
+    只看前者会漏——旧版启动清理就是这么写的,所以从来没清掉过一次卡住的 ALT。
+    反过来物理上确实在按(用户正用 Alt+Tab)时不去碰他,只处理我们自己留下的残留。
+    """
+    stuck: list[int] = []
+    for vk in MODIFIER_KEYS.values():
+        queued = ctypes.c_short(win32api.GetKeyState(vk)).value & 0x8000
+        physical = ctypes.c_short(win32api.GetAsyncKeyState(vk)).value & 0x8000
+        if queued and not physical:
+            stuck.append(vk)
+    return stuck
+
+
 def _set_foreground(hwnd: int) -> bool:
     """置前一次;被前台锁定拒绝时,借 ALT 键解锁后再试。
 
-    ALT 必须成对按下/抬起。SetForegroundWindow 失败会抛异常,若把抬键语句写在
-    同一个 try 的末尾,异常会直接跳过抬键,ALT 就永远卡在按下状态,用户的键盘与
-    鼠标输入随之错乱(菜单栏被激活、点击变成 Alt+点击、焦点乱跳)。因此抬键放在
-    finally 里,任何失败路径都不会漏。
+    ALT 的解锁脉冲必须在切换前台"之前"一次性发完(见 send_key_events),
+    而且只对够得着的目标用:提权窗口既拿不到焦点,又只会白白留下按键残留。
     """
     try:
         win32gui.SetForegroundWindow(hwnd)
@@ -171,20 +422,15 @@ def _set_foreground(hwnd: int) -> bool:
     except Exception:
         pass
 
-    alt_down = False
+    if runs_elevated(window_pid(hwnd)):
+        return False
+
+    pulse_keys([VK_MENU])
     try:
-        win32api.keybd_event(VK_MENU, 0, 0, 0)
-        alt_down = True
         win32gui.SetForegroundWindow(hwnd)
         return True
     except Exception:
         return False
-    finally:
-        if alt_down:
-            try:
-                win32api.keybd_event(VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
-            except Exception:
-                pass
 
 
 def foreground(hwnd: int) -> bool:
@@ -240,20 +486,17 @@ def idle_seconds() -> float | None:
 
 
 def release_stuck_modifiers() -> list[str]:
-    """把系统认为仍按着的修饰键抬起来,返回被清理的键名。
+    """把系统仍认为按着的修饰键抬起来,返回被清理的键名。
 
-    兜底用:旧版本在置前失败时会把 ALT 卡在按下态,启动时清理一次,
-    免得用户重启程序后仍然打字/点击错乱。
+    兜底用:启动时清一次(上一次崩溃/老版本留下的残留),每场点击结束再清一次。
+    判定只认"队列里按着、物理上没按着"(见 stuck_modifier_keys),
+    用户真按着 Alt+Tab 时不去打扰他。
     """
-    released: list[str] = []
-    for name, vk in MODIFIER_KEYS.items():
-        try:
-            if win32api.GetAsyncKeyState(vk) & 0x8000:
-                win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
-                released.append(name)
-        except Exception:
-            continue
-    return released
+    names = {vk: name for name, vk in MODIFIER_KEYS.items()}
+    stuck = stuck_modifier_keys()
+    if not stuck or not release_keys(stuck):
+        return []
+    return [names.get(vk, hex(vk)) for vk in stuck]
 
 
 def move_window(hwnd: int, rect: list[int] | tuple[int, int, int, int]) -> None:
@@ -271,6 +514,13 @@ def maximize(hwnd: int) -> None:
         logger.warning(f"窗口最大化失败:{exc}")
 
 
+def is_maximized(hwnd: int) -> bool:
+    try:
+        return bool(win32gui.IsZoomed(hwnd))
+    except Exception:
+        return False
+
+
 def window_rect(hwnd: int) -> list[int] | None:
     """读取窗口当前 [x, y, w, h];窗口无效(如仍最小化)时返回 None。
 
@@ -284,6 +534,99 @@ def window_rect(hwnd: int) -> list[int] | None:
     if width <= 0 or height <= 0:
         return None
     return [left, top, width, height]
+
+
+def client_rect(hwnd: int) -> list[int] | None:
+    """客户区在屏幕上的 [x, y, w, h] —— 截图和点击换算都以它为准。
+
+    窗口矩形带一圈 DWM 的不可见边框(最大化时是左上各 -8),用它当基准:
+      · 截图会被屏幕边界夹掉,图的原点变成 (0,0),和矩形原点 (-8,-8) 对不上,
+        于是每个录制点整体偏左 8 像素、贴着上边的点还偏上 8 像素;
+      · 夹出去的那几条还会把隔壁显示器的内容截进来干扰识别。
+    客户区原点本来就是屏幕可见的,录制图和点击换算用同一个框,偏差就没了。
+    """
+    try:
+        left, top = win32gui.ClientToScreen(hwnd, (0, 0))
+        _, _, width, height = win32gui.GetClientRect(hwnd)
+    except Exception:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return [left, top, width, height]
+
+
+def effective_rect(hwnd: int) -> list[int] | None:
+    """点击/截图用的矩形:优先客户区,拿不到时退回窗口矩形。"""
+    return client_rect(hwnd) or window_rect(hwnd)
+
+
+def _token_apis():
+    """取 kernel32/advapi32,并把令牌相关调用的签名固定好。
+
+    argtypes/restype 必须显式声明:当前进程伪句柄是 0xFFFFFFFFFFFFFFFF,
+    ctypes 默认按 32 位整型传参,传下去要么 OverflowError 要么被截断成无效句柄。
+    """
+    global _TOKEN_APIS_READY
+    kernel32, advapi32 = ctypes.windll.kernel32, ctypes.windll.advapi32
+    if not _TOKEN_APIS_READY:
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        advapi32.OpenProcessToken.restype = wintypes.BOOL
+        advapi32.OpenProcessToken.argtypes = (wintypes.HANDLE, wintypes.DWORD,
+                                              ctypes.POINTER(wintypes.HANDLE))
+        advapi32.GetTokenInformation.restype = wintypes.BOOL
+        advapi32.GetTokenInformation.argtypes = (wintypes.HANDLE, ctypes.c_uint,
+                                                 ctypes.c_void_p, wintypes.DWORD,
+                                                 ctypes.POINTER(wintypes.DWORD))
+        _TOKEN_APIS_READY = True
+    return kernel32, advapi32
+
+
+def _integrity_rid(token) -> int | None:
+    """令牌完整性级别:Low=0x1000、Medium=0x2000、High=0x3000、System=0x4000。"""
+    _, advapi32 = _token_apis()
+    buffer = ctypes.create_string_buffer(64)              # SID_AND_ATTRIBUTES
+    returned = wintypes.DWORD()
+    if not advapi32.GetTokenInformation(token, _TOKEN_INTEGRITY_LEVEL, buffer,
+                                        ctypes.sizeof(buffer), ctypes.byref(returned)):
+        return None
+    sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p)).contents.value
+    if not sid:
+        return None
+    count = ctypes.c_ubyte.from_address(sid + 1).value    # SubAuthorityCount
+    if not count:
+        return None
+    return ctypes.c_uint32.from_address(sid + 8 + 4 * (count - 1)).value
+
+
+def runs_elevated(pid: int | None) -> bool:
+    """目标进程的完整性级别是否比我们高——高一级就意味着鼠标点不进去。
+
+    坑在探测方式:PROCESS_QUERY_LIMITED_INFORMATION 是跨权限放行的(所以能开进程、
+    能查路径),拿它当"够不够得着"会一律得到"够得着"。真门槛在令牌上:
+    令牌打不开(拒绝访问)或级别比我们高,注入的鼠标就被系统静默丢掉。
+    """
+    if not pid:
+        return False
+    kernel32, advapi32 = _token_apis()
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return kernel32.GetLastError() == 5               # ERROR_ACCESS_DENIED
+    token, ours = wintypes.HANDLE(), wintypes.HANDLE()
+    try:
+        if not advapi32.OpenProcessToken(handle, _TOKEN_QUERY, ctypes.byref(token)):
+            return kernel32.GetLastError() == 5
+        if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(),
+                                         _TOKEN_QUERY, ctypes.byref(ours)):
+            return False
+        mine, theirs = _integrity_rid(ours), _integrity_rid(token)
+        return bool(mine and theirs and theirs > mine)
+    finally:
+        kernel32.CloseHandle(handle)
+        if token.value:
+            kernel32.CloseHandle(token)
 
 
 # ---------------- 进程 ----------------
@@ -308,7 +651,7 @@ def is_alive(pid: int | None) -> bool:
 def launch(exe: str) -> subprocess.Popen:
     exe_path = Path(exe)
     if not exe_path.is_file():
-        raise FileNotFoundError(f"ZCode.exe 不存在:{exe}")
+        raise FileNotFoundError(f"客户端程序不存在:{exe}")
     logger.info(f"启动客户端:{exe}")
     return subprocess.Popen([str(exe_path)], cwd=str(exe_path.parent))
 
@@ -339,11 +682,14 @@ def kill_tree(pid: int | None, timeout: float = 15.0, expected_exe: str = "") ->
     if is_protected_exe(path):
         logger.error(f"拒绝结束受保护进程 {Path(path).name}(PID {pid})")
         return False
+    if is_own_exe(path):
+        logger.error(f"拒绝结束本程序自身(PID {pid},{path})")
+        return False
     if expected_exe and not _same_path(path, expected_exe):
         logger.error(f"拒绝结束 PID {pid}:进程为 {path},与预期 {expected_exe} 不一致")
         return False
 
-    logger.info(f"关闭 ZCode(PID {pid},{path})")
+    logger.info(f"关闭客户端(PID {pid},{path})")
     try:
         res = subprocess.run(
             ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
@@ -385,22 +731,60 @@ def process_path(pid: int) -> str | None:
                 pass
 
 
+# pid → 路径的短 TTL 缓存:一次进程扫描要问几百次,窗口轮询又会反复扫,
+# 不做缓存的话每轮枚举都要付几百次系统调用的代价。
+_PATH_CACHE: dict[int, tuple[float, str]] = {}
+_PATH_CACHE_TTL = 5.0
+_PATH_CACHE_MAX = 4096
+
+
+def process_path_cached(pid: int) -> str | None:
+    now = time.monotonic()
+    hit = _PATH_CACHE.get(int(pid))
+    if hit and now - hit[0] < _PATH_CACHE_TTL:
+        return hit[1]
+    path = process_path(pid)
+    if path:            # 只缓存成功结果:失败可能只是瞬时权限问题
+        if len(_PATH_CACHE) >= _PATH_CACHE_MAX:
+            _PATH_CACHE.clear()
+        _PATH_CACHE[int(pid)] = (now, path)
+    return path
+
+
 # ---------------- exe 探测 ----------------
 
-def find_running_exe(name_match: str = "zcode") -> str | None:
-    """从运行中的进程里找(最可靠:用户已打开过客户端)。"""
-    match = name_match.lower()
+def find_running_exe(exe_name: str = "zcode") -> str | None:
+    """从运行中的进程里探测客户端可执行文件(最可靠:用户已打开过客户端)。
+
+    关键字匹配是当年误伤的源头:本程序打包后叫 ZCodeAssistant.exe,含 "zcode",
+    于是"探测客户端"返回自己的路径,后续每次尝试都在启动第二个自己。
+    现在先按名字排序、优先完全同名,并且一律排除本程序与受保护进程。
+    """
+    match = (exe_name or "").lower()
+    stem = Path(match).stem if match else ""
     try:
         pids = win32process.EnumProcesses()
     except Exception:
         return None
+    hits: list[str] = []
     for pid in pids:
         if pid <= 4:
             continue
-        path = process_path(pid)
-        if path and match in Path(path).name.lower():
-            return path
-    return None
+        path = process_path_cached(int(pid))
+        if not path or is_own_exe(path) or is_protected_exe(path):
+            continue
+        name = Path(path).name.lower()
+        if match and match not in name:
+            continue
+        hits.append(path)
+    if not hits:
+        return None
+    # 精确名(ZCode.exe)优先于任何含关键字的路径(ZCodeAssistant.exe / zcode-updater.exe)
+    for hit in hits:
+        if stem and Path(hit).name.lower() in (f"{stem}.exe", stem):
+            return hit
+    hits.sort(key=lambda p: len(Path(p).name))
+    return hits[0]
 
 
 def _start_menu_dirs() -> list[Path]:
@@ -459,6 +843,7 @@ def _iter_files(root: Path, max_depth: int = 3, limit: int = 30000):
 def search_exe(name_match: str = "zcode") -> str | None:
     """扫描开始菜单快捷方式与常见安装目录。"""
     match = name_match.lower()
+    stem = Path(match).stem if match else ""
     for d in _start_menu_dirs():
         try:
             links = list(d.rglob("*.lnk"))
@@ -467,8 +852,9 @@ def search_exe(name_match: str = "zcode") -> str | None:
         for lnk in links:
             if match in lnk.stem.lower():
                 target = _resolve_lnk(lnk)
-                if target and target.lower().endswith(".exe") and Path(target).is_file():
-                    logger.info(f"从开始菜单找到 ZCode:{target}")
+                if target and target.lower().endswith(".exe") and Path(target).is_file() \
+                        and not is_own_exe(target):
+                    logger.info(f"从开始菜单找到客户端:{target}")
                     return target
 
     roots: list[Path] = []
@@ -477,16 +863,26 @@ def search_exe(name_match: str = "zcode") -> str | None:
         if value:
             roots.append(Path(value))
     roots.append(Path.home() / "AppData" / "Local" / "Programs")
+    loose: str | None = None
     for root in roots:
         if not root.exists():
             continue
         for f in _iter_files(root, max_depth=3):
-            if f.suffix.lower() == ".exe" and match in f.name.lower():
-                logger.info(f"在安装目录找到 ZCode:{f}")
-                return str(f)
-    return None
+            if f.suffix.lower() != ".exe" or match not in f.name.lower():
+                continue
+            path = str(f)
+            if is_own_exe(path):
+                continue
+            # 精确同名可以直接返回;只是"名字里含关键字"的先记下来继续找
+            if stem and f.name.lower() in (f"{stem}.exe", stem):
+                logger.info(f"在安装目录找到客户端:{path}")
+                return path
+            loose = loose or path
+    if loose:
+        logger.info(f"在安装目录找到名称相近的客户端:{loose}")
+    return loose
 
 
 def autodetect_exe(name_match: str = "zcode") -> str | None:
-    """优先从运行进程取路径,其次扫描磁盘。"""
+    """优先从运行进程取路径,其次扫描磁盘。任何情况下都不会返回本程序自己的路径。"""
     return find_running_exe(name_match) or search_exe(name_match)

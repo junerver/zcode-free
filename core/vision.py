@@ -17,7 +17,7 @@ import httpx
 from loguru import logger
 from PIL import Image
 
-from core.config import ConfigStore
+from core.config import DEFAULTS, ConfigStore
 
 LOCATE_PROMPT = """你是桌面软件自动化助手。图片是 ZCode 客户端窗口的截图。
 任务:在图中找到「领取」按钮并判断页面状态。
@@ -84,6 +84,41 @@ VERIFY_PROMPT = """你是桌面软件自动化助手。图片是点击「领取�
 
 _STRICT_SUFFIX = "\n注意:只输出一个 json 对象,不要输出任何解释文字。"
 
+# 固定坐标流程(steps 目标)的结果校验提示:这类应用没有"福利卡片"可言,
+# 关心的是点完之后按钮文案有没有变成"已领取/已签到",或有没有报错弹窗。
+GENERIC_VERIFY_PROMPT = """你是桌面软件自动化助手。图片是 {name} 窗口在执行完一组点击之后的截图。
+任务:判断这次签到/领取的结果。
+
+判断:
+- 成功:出现「领取成功 / 签到成功 / 已到账 / 获得 / +数字」这类提示,或原本的可点按钮
+  已经变成「已领取 / 已签到 / 今日已领取 / 明天再来」这类不可点文案。
+- 失败:出现「领取失败 / 签到失败 / 请稍后再试 / 用量不足 / 网络异常」这类提示。
+- 加载中:仍在转圈或出现「领取中 / 处理中 / 请稍候 / 发放中」→ 请求已提交、服务端还在处理。
+规则:
+1. 判定成功 → success 为 true,failed 为 false,popup 为 "success"。
+2. 判定失败 → failed 为 true,success 为 false,popup 为 "failure"。
+3. 加载中 → pending 为 true,popup 为 "pending",success 与 failed 都为 false。
+   加载中不等于失败,不要报 failed。
+4. 按钮文案已变成不可点的「已领取/已签到」且没有弹窗 → claimed 为 true。
+5. 页面看不出任何变化 → success、failed、claimed、pending 全为 false,popup 为 null。
+6. card_visible:签到入口(按钮或卡片)此刻是否还在画面上(在=true,不在=false)。
+7. keywords / ocr_texts 只填图上**真实出现**的文字,不要凭想象补。
+8. notes 里用一句话说明依据,不要复述规则。
+9. 只输出 json,不要输出任何其他文字。
+
+输出示例:
+{{"success":false,"failed":false,"claimed":true,"pending":false,"card_visible":true,
+ "popup":null,"keywords":["已签到"],"ocr_texts":["每日领100积分","已签到"],
+ "confidence":0.9,"notes":"按钮文案已变为已签到,不可再点击"}}
+"""
+
+
+def verify_prompt_for(target: dict | None) -> str:
+    """按目标选校验提示词:固定坐标流程用通用文案,视觉流程沿用 ZCode 那套。"""
+    if target and target.get("flow") == "steps":
+        return GENERIC_VERIFY_PROMPT.format(name=target.get("name") or target.get("id") or "目标应用")
+    return VERIFY_PROMPT
+
 
 def parse_json(text: str) -> dict | None:
     """从模型输出中抽取 JSON:去代码围栏 → 直接解析 → 平衡括号截取。"""
@@ -141,8 +176,8 @@ class VisionClient:
         logger.debug(f"定位结果:{json.dumps(res, ensure_ascii=False)}")
         return res
 
-    def verify(self, png: bytes) -> dict:
-        res = self.chat(VERIFY_PROMPT, png)
+    def verify(self, png: bytes, target: dict | None = None) -> dict:
+        res = self.chat(verify_prompt_for(target), png)
         logger.debug(f"校验结果:{json.dumps(res, ensure_ascii=False)}")
         return res
 
@@ -168,10 +203,14 @@ class VisionClient:
             return {"error": "未配置 API Key", "confidence": 0}
 
         b64 = base64.b64encode(png).decode("ascii")
-        url = (vision.get("base_url") or "https://api.deepseek.com").rstrip("/") + "/chat/completions"
+        # 留空时用 DEFAULTS 里的出厂地址/模型,别再抄一份字面量:面板回填默认值时
+        # 读的就是 DEFAULTS,两处各写各的曾经让面板显示和实际请求不一致。
+        default_vision = DEFAULTS.get("vision") or {}
+        url = (vision.get("base_url") or default_vision.get("base_url")
+               or "https://api.deepseek.com").rstrip("/") + "/chat/completions"
         timeout = float(vision.get("timeout_s") or 20)
         body = {
-            "model": vision.get("model") or "deepseek-v4-flash-vision-exp",
+            "model": vision.get("model") or default_vision.get("model") or "deepseek-chat",
             "messages": [
                 {
                     "role": "user",
@@ -196,46 +235,50 @@ class VisionClient:
 
         last_error = "未知错误"
         strict = False
-        for attempt in range(3):
-            if strict:
-                body["messages"][0]["content"][0]["text"] = prompt + _STRICT_SUFFIX
-            try:
-                resp = httpx.post(url, json=body, headers=headers, timeout=timeout)
-            except Exception as exc:
-                last_error = f"网络错误:{exc}"
-                logger.warning(f"视觉 API 请求失败({attempt + 1}/3):{exc}")
-                time.sleep(1.2)
-                continue
+        # trust_env=False:默认会读环境里的 HTTP(S)_PROXY/NO_PROXY,而 NO_PROXY 常见写法
+        # 带 [::1],httpx 0.28 解析它会抛 InvalidURL("Invalid port: ':1]'"),
+        # 请求根本发不出去。这里显式连目标地址,行为不受启动它的那个终端影响。
+        with httpx.Client(trust_env=False) as client:
+            for attempt in range(3):
+                if strict:
+                    body["messages"][0]["content"][0]["text"] = prompt + _STRICT_SUFFIX
+                try:
+                    resp = client.post(url, json=body, headers=headers, timeout=timeout)
+                except Exception as exc:
+                    last_error = f"网络错误:{exc}"
+                    logger.warning(f"视觉 API 请求失败({attempt + 1}/3):{exc}")
+                    time.sleep(1.2)
+                    continue
 
-            # 模型不支持 response_format 时自动去掉重试
-            if resp.status_code == 400 and "response_format" in body and "response_format" in resp.text:
-                logger.warning("接口不支持 response_format 参数,已去掉后重试")
-                body.pop("response_format", None)
-                continue
-            if resp.status_code in (429, 500, 502, 503, 504):
-                last_error = f"HTTP {resp.status_code}"
-                logger.warning(f"视觉 API 暂时不可用({resp.status_code}),稍后重试")
-                time.sleep(1.5)
-                continue
-            if resp.status_code >= 400:
-                last_error = f"HTTP {resp.status_code}:{resp.text[:200]}"
-                logger.error(f"视觉 API 报错:{last_error}")
-                break
+                # 模型不支持 response_format 时自动去掉重试
+                if resp.status_code == 400 and "response_format" in body and "response_format" in resp.text:
+                    logger.warning("接口不支持 response_format 参数,已去掉后重试")
+                    body.pop("response_format", None)
+                    continue
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    last_error = f"HTTP {resp.status_code}"
+                    logger.warning(f"视觉 API 暂时不可用({resp.status_code}),稍后重试")
+                    time.sleep(1.5)
+                    continue
+                if resp.status_code >= 400:
+                    last_error = f"HTTP {resp.status_code}:{resp.text[:200]}"
+                    logger.error(f"视觉 API 报错:{last_error}")
+                    break
 
-            try:
-                content = resp.json()["choices"][0]["message"].get("content") or ""
-            except Exception as exc:
-                last_error = f"响应解析失败:{exc}"
-                logger.warning(last_error)
-                continue
+                try:
+                    content = resp.json()["choices"][0]["message"].get("content") or ""
+                except Exception as exc:
+                    last_error = f"响应解析失败:{exc}"
+                    logger.warning(last_error)
+                    continue
 
-            parsed = parse_json(content)
-            if parsed is None:
-                last_error = "模型未返回有效 json"
-                logger.warning(f"JSON 解析失败,严格模式重试;原文:{content[:120]!r}")
-                strict = True
-                continue
-            parsed.setdefault("confidence", 0)
-            return parsed
+                parsed = parse_json(content)
+                if parsed is None:
+                    last_error = "模型未返回有效 json"
+                    logger.warning(f"JSON 解析失败,严格模式重试;原文:{content[:120]!r}")
+                    strict = True
+                    continue
+                parsed.setdefault("confidence", 0)
+                return parsed
 
         return {"error": last_error, "confidence": 0}
